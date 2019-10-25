@@ -1,0 +1,54 @@
+run:
+  deadline: 30s
+  # modules-download-mode: release
+linters-settings:
+    gocyclo:
+      min-complexity: 10
+    goimports:
+      local-prefixes: github.com/avito-tech/navigator
+
+linters:
+  enable:
+    - bodyclose
+    - deadcode
+    - depguard
+    - dupl
+    - errcheck
+    - gochecknoinits
+    - goconst
+    - gocritic
+    - gocyclo
+    - goimports
+    - golint
+    - gosec
+    - gosimple
+    - ineffassign
+    - interfacer
+    - misspell
+    - nakedret
+    - scopelint
+    - staticcheck
+    - structcheck
+    - stylecheck
+    - typecheck
+    - unconvert
+    - unparam
+    - unused
+    - scopelint
+    - varcheck
+
+  disable:
+    - gochecknoglobals
+    - gofmt
+    - lll
+    - maligned
+    - prealloc
+
+issues:
+  exclude-rules:
+    - linters:
+      - unparam
+      text: "always receives"
+    - linters:
+      - golint
+      text: "a blank import"

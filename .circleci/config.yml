@@ -1,0 +1,31 @@
+version: 2.1
+orbs:
+  kube-orb: circleci/kubernetes@0.3
+
+jobs:
+  build:
+    environment: CHANGE_MINIKUBE_NONE_USER=true
+    machine:
+      image: 'ubuntu-1604:201903-01'
+    steps:
+      - checkout
+      - kube-orb/install
+      - run:
+          command: |
+            curl -L https://dl.google.com/go/go1.12.7.linux-amd64.tar.gz -o /tmp/go.tar.gz
+            sudo rm -rf /usr/local/go
+            sudo tar -C /usr/local -xzf /tmp/go.tar.gz
+            curl -L https://github.com/kubernetes-sigs/kind/releases/download/v0.4.0/kind-linux-amd64 -o /tmp/kind
+            chmod +x /tmp/kind && sudo mv /tmp/kind /usr/local/bin
+          name: install dependencies
+      - run:
+          command: bash tests/e2e/setup/init-clusters.sh
+          name: init clusters
+
+      - run:
+          name: build test rig
+          command: bash tests/e2e/setup/build-test-rig.sh
+
+      - run:
+          command: make test-e2e
+          name: test-e2e

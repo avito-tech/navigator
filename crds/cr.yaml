@@ -1,0 +1,26 @@
+apiVersion: "navigator.avito.ru/v1"
+kind: CanaryRelease
+metadata:
+  name: payments
+  namespace: payments
+spec:
+  backends:
+  - namespace: "payments"
+    name: "payments-v1"
+    weight: 30
+  - namespace: "payments"
+    name: "payments"
+    weight: 70
+
+---
+apiVersion: "navigator.avito.ru/v1"
+kind: Nexus
+metadata:
+  name: service-releases-v1
+spec:
+  appName: service-releases
+  services:
+  - namespace: "service-releases"
+    name: "" # all services in service-releases NS
+  - namespace: "payments"
+    name: "redis" # particular service redis in payments namespace

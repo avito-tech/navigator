@@ -1,0 +1,256 @@
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: %NAMESPACE%.main
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      component: main
+  template:
+    metadata:
+      labels:
+        component: main
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: main
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+          image: %TEST_RIG_IMAGE%:%VERSION%
+          imagePullPolicy: Never
+          command: ["/probe-server", ":80", "%CLUSTER_NAME%"]
+          ports:
+            - containerPort: 80
+
+---
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name:  %NAMESPACE%.aux
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      component: aux
+  template:
+    metadata:
+      labels:
+        component: aux
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: aux
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+          image: %TEST_RIG_IMAGE%:%VERSION%
+          imagePullPolicy: Never
+          command: ["/probe-server", ":80", "%CLUSTER_NAME%"]
+          ports:
+            - containerPort: 80
+
+---
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name:  %NAMESPACE%.new
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      component: new
+  template:
+    metadata:
+      labels:
+        component: new
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: new
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+          image: %TEST_RIG_IMAGE%:%VERSION%
+          imagePullPolicy: Never
+          command: ["/probe-server", ":80", "%CLUSTER_NAME%"]
+          ports:
+            - containerPort: 80
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  creationTimestamp: 2019-05-23T17:07:15Z
+  name: curl
+spec:
+  terminationGracePeriodSeconds: 0
+  initContainers:
+    - name: envoy-init
+      image: %NAVIGATOR_IMAGE_INIT%:%VERSION%
+      imagePullPolicy: Never
+      securityContext:
+        capabilities:
+          add:
+            - NET_ADMIN
+      env:
+        - name: CLUSTER_SUBNETS
+          value: "10.96.0.0/12,10.96.0.0/12"
+        - name: OUTBOUND_INTERCEPT_PORTS
+          value: " "
+        - name: INBOUND_INTERCEPT_PORTS
+          value: " "
+  containers:
+    - name: c
+      image: %TEST_RIG_IMAGE%:%VERSION%
+      imagePullPolicy: Never
+      command:
+        - /probe
+      env:
+        - name: APP_LIST
+          value: "%NS_LIST%"
+        - name: COMPONENT_LIST
+          value: "main aux"
+      securityContext:
+        capabilities:
+          add:
+            - NET_ADMIN
+        privileged: true
+        readOnlyRootFilesystem: false
+    - name: e
+      image: %NAVIGATOR_IMAGE_SIDECAR%:%VERSION%
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        capabilities:
+          add:
+            - NET_ADMIN
+      env:
+        - name: NAVIGATOR_ADDRESS
+          value: "%NAVIGATOR_ADDRESS%"
+        - name: NAVIGATOR_PORT
+          value: "8001"
+        - name: LOG_LEVEL
+          value: info
+        - name: SERVICE_NAME
+          value: %NAMESPACE%
+        - name: CLUSTER_NAME
+          value: %CLUSTER_NAME%
+      readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health
+            port: 7313
+            scheme: HTTP
+          initialDelaySeconds: 3
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 3
+      volumeMounts:
+        - name: config
+          mountPath: /config
+  volumes:
+    - name: config
+      configMap:
+            name: envoy-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: main
+  labels:
+    component: main
+spec:
+  selector:
+    component: main
+  ports:
+    - name: http-main-port
+      protocol: TCP
+      port: 8999
+      targetPort: 80
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aux
+  labels:
+    component: aux
+spec:
+  selector:
+    component: aux
+  ports:
+    - name: http-main-port
+      protocol: TCP
+      port: 8999
+      targetPort: 80
+
+
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: envoy-config
+data:
+  envoy.yaml: |-
+    static_resources:
+      listeners:
+      - address:
+          socket_address:
+            address: 0.0.0.0
+            port_value: 15001
+        filter_chains:
+          - filters:
+              - name: envoy.tcp_proxy
+                config:
+                  cluster: "BlackHoleCluster"
+                  stat_prefix: "BlackHoleCluster"
+        use_original_dst: true
+      clusters:
+        - name: navigator
+          alt_stat_name: navigator_8001
+          type: STRICT_DNS
+          connect_timeout: "5s"
+          hosts:
+          - socket_address:
+              address: %NAVIGATOR_ADDRESS%
+              port_value: 8001
+          circuit_breakers:
+            thresholds:
+            - priority: DEFAULT
+              max_connections: 100000
+              max_pending_requests: 100000
+              max_requests: 100000
+            - priority: HIGH
+              max_connections: 100000
+              max_pending_requests: 100000
+              max_requests: 100000
+          upstream_connection_options:
+            tcp_keepalive:
+              keepalive_time: 300
+          http2_protocol_options: {}
+    admin:
+      access_log_path: "/dev/null"
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 9001
+
+    dynamic_resources:
+      lds_config:
+        api_config_source:
+          api_type: GRPC
+          grpc_services:
+            envoy_grpc:
+              cluster_name: navigator
+      cds_config:
+        api_config_source:
+          api_type: GRPC
+          grpc_services:
+            envoy_grpc:
+              cluster_name: navigator
