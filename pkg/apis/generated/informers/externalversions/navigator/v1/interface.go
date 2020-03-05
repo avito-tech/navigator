@@ -26,6 +26,8 @@ import (
 type Interface interface {
 	// CanaryReleases returns a CanaryReleaseInformer.
 	CanaryReleases() CanaryReleaseInformer
+	// Gateways returns a GatewayInformer.
+	Gateways() GatewayInformer
 	// Nexuses returns a NexusInformer.
 	Nexuses() NexusInformer
 }
@@ -44,6 +46,11 @@ func New(f internalinterfaces.SharedInformerFactory, namespace string, tweakList
 // CanaryReleases returns a CanaryReleaseInformer.
 func (v *version) CanaryReleases() CanaryReleaseInformer {
 	return &canaryReleaseInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// Gateways returns a GatewayInformer.
+func (v *version) Gateways() GatewayInformer {
+	return &gatewayInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
 // Nexuses returns a NexusInformer.

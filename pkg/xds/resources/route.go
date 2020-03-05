@@ -1,212 +1,91 @@
 package resources
 
 import (
-	"sort"
 	"sync"
 
-	"github.com/avito-tech/navigator/pkg/grpc"
-	"github.com/avito-tech/navigator/pkg/k8s"
-
 	api "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/route"
+	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	route "github.com/envoyproxy/go-control-plane/envoy/api/v2/route"
 	"github.com/envoyproxy/go-control-plane/pkg/cache"
-	"github.com/gogo/protobuf/proto"
-	"github.com/gogo/protobuf/types"
+	"github.com/golang/protobuf/ptypes/duration"
+	"github.com/golang/protobuf/ptypes/wrappers"
+
+	"github.com/avito-tech/navigator/pkg/k8s"
 )
 
-type RouteConfigurationByCluster struct {
-	ClusterID          string
-	RouteConfiguration *api.RouteConfiguration
-}
-
-// RouteCache manages the contents of the gRPC RDS cache.
 type RouteCache struct {
+	muUpdate sync.Mutex
+
 	HealthCheckConfig
 
-	observable
-
-	mu                  sync.Mutex
-	routeNamesByService map[k8s.QualifiedName][]RouteConfigurationByCluster
+	*BranchedResourceCache
+	isGatewayOnly bool
 }
 
-type clusterRouteCache struct {
-	*RouteCache
-	clusterID string
-}
-
-// NewRouteCache returns an instance of a RouteCache
 func NewRouteCache(opts ...FuncOpt) *RouteCache {
 	r := &RouteCache{
-		routeNamesByService: map[k8s.QualifiedName][]RouteConfigurationByCluster{},
+		BranchedResourceCache: NewBranchedResourceCache(cache.RouteType),
 	}
 	r.EnableHealthCheck = false
 	SetOpts(r, opts...)
+
+	static := []NamedProtoMessage{}
+	if r.EnableHealthCheck {
+		static = append(static, r.healthRoute())
+	}
+	r.SetStaticResources(static)
 	return r
 }
 
-func (c *RouteCache) Get(clusterID string) (resource grpc.Resource, ok bool) {
-	clustered := &clusterRouteCache{RouteCache: c, clusterID: clusterID}
-	return clustered, true
-}
+func (c *RouteCache) UpdateServices(updated, deleted []*k8s.Service) {
 
-func (c *RouteCache) AddService(service *k8s.Service) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.muUpdate.Lock()
+	defer c.muUpdate.Unlock()
 
-	serviceKey := service.Key()
-	c.removeServiceByName(serviceKey)
-
-	for _, p := range service.Ports {
-		if p.Protocol != k8s.ProtocolTCP {
-			continue
-		}
-
-		for _, clusterIP := range service.ClusterIPs {
-			name := ListenerName(clusterIP.IP, p.Port)
-			clusters := weightedClusters(p.Name, service.BackendsBySourceID)
-			routeConf := routeConfiguration(name, clusters)
-			c.routeNamesByService[serviceKey] = append(c.routeNamesByService[serviceKey], RouteConfigurationByCluster{
-				ClusterID:          clusterIP.ClusterID,
-				RouteConfiguration: routeConf,
-			})
-		}
+	if c.isGatewayOnly {
+		return
 	}
 
-	return nil
-}
+	updatedResource := map[string][]NamedProtoMessage{}
+	deletedResources := map[string][]NamedProtoMessage{}
 
-func (c *RouteCache) RemoveService(serviceKey k8s.QualifiedName) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.removeServiceByName(serviceKey)
-	return nil
-}
-
-func (c *RouteCache) removeServiceByName(serviceKey k8s.QualifiedName) {
-	c.routeNamesByService[serviceKey] = nil
-}
-
-func (c *RouteCache) getNameToRouteMapping() map[string]map[string]*api.RouteConfiguration {
-	mapping := make(map[string]map[string]*api.RouteConfiguration)
-
-	for _, v := range c.routeNamesByService {
-		for _, r := range v {
-			if _, ok := mapping[r.ClusterID]; !ok {
-				mapping[r.ClusterID] = make(map[string]*api.RouteConfiguration)
-			}
-			mapping[r.ClusterID][r.RouteConfiguration.Name] = r.RouteConfiguration
-		}
+	for _, u := range updated {
+		c.getServiceRoutes(updatedResource, u)
+	}
+	for _, d := range deleted {
+		c.getServiceRoutes(deletedResources, d)
 	}
 
-	return mapping
+	c.UpdateBranchedResources(updatedResource, deletedResources)
 }
 
-// Contents returns a copy of the cache's contents.
-func (c *clusterRouteCache) Contents() []proto.Message {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var values []proto.Message
+func (c *RouteCache) UpdateIngresses(updated map[k8s.QualifiedName]*k8s.Ingress) {
 
-	health := healthRouteConfiguration(c.HealthCheckName, c.HealthCheckPath)
-	values = append(values, health)
-	for _, v := range c.getNameToRouteMapping()[c.clusterID] {
-		values = append(values, v)
+	c.muUpdate.Lock()
+	defer c.muUpdate.Unlock()
+
+	if !c.isGatewayOnly {
+		c.isGatewayOnly = true
+		c.RenewResourceCache()
 	}
-	sort.Stable(routesByName(values))
-	return values
-
+	updatedResource := map[string][]NamedProtoMessage{}
+	c.getIngressRoutes(updatedResource, updated)
+	c.UpdateBranchedResources(updatedResource, nil)
 }
 
-func (c *clusterRouteCache) Query(names []string) []proto.Message {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	mapping := c.getNameToRouteMapping()
-	var values []proto.Message
-	for _, n := range names {
-		v, ok := mapping[c.clusterID][n]
-		if ok {
-			values = append(values, v)
-		}
-		if n == c.HealthCheckName {
-			health := healthRouteConfiguration(c.HealthCheckName, c.HealthCheckPath)
-			values = append(values, health)
-		}
-	}
-	sort.Stable(routesByName(values))
-	return values
+func (c *RouteCache) UpdateGateway(gw *k8s.Gateway) {
+	// do nothing
 }
 
-func (*RouteCache) TypeURL() string { return cache.RouteType }
-
-type routesByName []proto.Message
-
-func (l routesByName) Len() int      { return len(l) }
-func (l routesByName) Swap(i, j int) { l[i], l[j] = l[j], l[i] }
-func (l routesByName) Less(i, j int) bool {
-	return l[i].(*api.RouteConfiguration).Name < l[j].(*api.RouteConfiguration).Name
-}
-
-func routeConfiguration(name string, clusters *route.WeightedCluster) *api.RouteConfiguration {
+func (c *RouteCache) healthRoute() *api.RouteConfiguration {
 	return &api.RouteConfiguration{
-		Name: name,
-		VirtualHosts: []route.VirtualHost{{
-			Name:    name,
+		Name: c.HealthCheckName,
+		VirtualHosts: []*route.VirtualHost{{
+			Name:    c.HealthCheckName,
 			Domains: []string{"*"},
-			Routes: []route.Route{{
-				Match: route.RouteMatch{
-					PathSpecifier: &route.RouteMatch_Prefix{Prefix: "/"},
-				},
-				Action: &route.Route_Route{
-					Route: &route.RouteAction{
-						ClusterSpecifier: &route.RouteAction_WeightedClusters{
-							WeightedClusters: clusters,
-						},
-					},
-				},
-			}},
-		}},
-	}
-}
-
-func weightedClusters(portName string, backendsBySourceID map[k8s.BackendSourceID]k8s.WeightedAddressSet) *route.WeightedCluster {
-	clusterWeight := map[string]int{}
-	for backend, weightedAdressSet := range backendsBySourceID {
-		clusterWeight[backend.ClusterID] += weightedAdressSet.Weight
-	}
-
-	var totalWeight uint32
-	clusters := []*route.WeightedCluster_ClusterWeight{}
-	for backend, weightedAddressSet := range backendsBySourceID {
-		// normalize weight (weight/clusterSum * defaultMax)
-		weight := int(float32(weightedAddressSet.Weight) /
-			float32(clusterWeight[backend.ClusterID]) *
-			float32(k8s.EndpointsWeightSumForCluster))
-		cluster := &route.WeightedCluster_ClusterWeight{
-			Name:   HTTPClusterName(backend, portName),
-			Weight: &types.UInt32Value{Value: uint32(weight)},
-		}
-		totalWeight += uint32(weight)
-		clusters = append(clusters, cluster)
-	}
-
-	return &route.WeightedCluster{
-		TotalWeight: &types.UInt32Value{Value: totalWeight},
-		Clusters:    clusters,
-	}
-}
-
-func healthRouteConfiguration(name, path string) *api.RouteConfiguration {
-	return &api.RouteConfiguration{
-		Name: name,
-		VirtualHosts: []route.VirtualHost{{
-			Name:    name,
-			Domains: []string{"*"},
-			Routes: []route.Route{{
-				Match: route.RouteMatch{
-					PathSpecifier: &route.RouteMatch_Prefix{Prefix: path},
+			Routes: []*route.Route{{
+				Match: &route.RouteMatch{
+					PathSpecifier: &route.RouteMatch_Prefix{Prefix: c.HealthCheckPath},
 				},
 				Action: &route.Route_DirectResponse{
 					DirectResponse: &route.DirectResponseAction{
@@ -220,5 +99,166 @@ func healthRouteConfiguration(name, path string) *api.RouteConfiguration {
 				},
 			}},
 		}},
+	}
+}
+
+func (c *RouteCache) getIngressRoutes(storage map[string][]NamedProtoMessage, updated map[k8s.QualifiedName]*k8s.Ingress) {
+
+	// map[cluster]map[hostname]map[route]RouteConfig
+	routes := map[string]map[string]map[string]*route.Route{}
+
+	for _, ingress := range updated {
+		// add cluster for storage if not exists
+		if _, ok := storage[ingress.ClusterID]; !ok {
+			storage[ingress.ClusterID] = []NamedProtoMessage{}
+		}
+		// add cluster for routes
+		if _, ok := routes[ingress.ClusterID]; !ok {
+			routes[ingress.ClusterID] = map[string]map[string]*route.Route{}
+		}
+
+		// add rules
+		for _, rule := range ingress.Rules {
+			if _, ok := routes[ingress.ClusterID][rule.Host]; !ok {
+				routes[ingress.ClusterID][rule.Host] = map[string]*route.Route{}
+			}
+
+			for _, path := range rule.Paths {
+				routeTo := weightedClusters(ingress.Namespace, path.ServiceName, path.PortName)
+				var hashPolicy []*route.RouteAction_HashPolicy
+				if path.CookieAffinity != nil {
+					hashPolicy = routeHashPolicy(*path.CookieAffinity)
+				}
+				routes[ingress.ClusterID][rule.Host][path.Path] = getRoute(path.Path, path.Rewrite, routeTo, hashPolicy)
+			}
+		}
+	}
+
+	for cluster, hostRules := range routes {
+		// create config form routes
+		vhosts := []*route.VirtualHost{}
+		for domain, rules := range hostRules {
+			name := domain
+			if len(name) == 0 {
+				name = "*"
+				// with empty host provided we should match any
+				domain = "*"
+			}
+			vhosts = append(vhosts, getVirtualHost(name, domain, rules))
+		}
+		r := routeIngressConfiguration(GatewayListenerPrefix, vhosts)
+		// add config for cluster
+		storage[cluster] = append(storage[cluster], r)
+	}
+}
+
+func (c *RouteCache) getServiceRoutes(storage map[string][]NamedProtoMessage, service *k8s.Service) {
+	for _, p := range service.Ports {
+		if p.Protocol != k8s.ProtocolTCP {
+			continue
+		}
+
+		for _, clusterIP := range service.ClusterIPs {
+			name := ListenerNameFromService(service.Namespace, service.Name, p.Port)
+			clusters := weightedClusters(service.Namespace, service.Name, p.Name)
+			routeConf := routeServiceConfiguration(name, clusters)
+			clusterID := clusterIP.ClusterID
+			if _, ok := storage[clusterID]; !ok {
+				storage[clusterID] = []NamedProtoMessage{}
+			}
+			storage[clusterID] = append(storage[clusterID], routeConf)
+		}
+	}
+}
+
+func routeServiceConfiguration(name string, clusters *route.WeightedCluster) *api.RouteConfiguration {
+	return &api.RouteConfiguration{
+		Name: name,
+		VirtualHosts: []*route.VirtualHost{{
+			Name:    name,
+			Domains: []string{"*"},
+			Routes: []*route.Route{{
+				Match: &route.RouteMatch{
+					PathSpecifier: &route.RouteMatch_Prefix{Prefix: "/"},
+				},
+				Action: &route.Route_Route{
+					Route: &route.RouteAction{
+						RetryPolicy: retryPolicy(),
+						ClusterSpecifier: &route.RouteAction_WeightedClusters{
+							WeightedClusters: clusters,
+						},
+					},
+				},
+			}},
+		}},
+	}
+}
+
+func getRoute(pathPrefix string, prefixRewrite string, weightedCluster *route.WeightedCluster, hashPolicy []*route.RouteAction_HashPolicy) *route.Route {
+	return &route.Route{
+		Match: &route.RouteMatch{
+			PathSpecifier: &route.RouteMatch_Prefix{Prefix: pathPrefix},
+		},
+		Action: &route.Route_Route{
+			Route: &route.RouteAction{
+				IdleTimeout: &duration.Duration{},
+				Timeout:     &duration.Duration{},
+				HashPolicy:  hashPolicy,
+				RetryPolicy: retryPolicy(),
+				ClusterSpecifier: &route.RouteAction_WeightedClusters{
+					WeightedClusters: weightedCluster,
+				},
+				PrefixRewrite: prefixRewrite,
+			},
+		},
+	}
+}
+
+func weightedClusters(namespace, serviceName, portName string) *route.WeightedCluster {
+	return &route.WeightedCluster{
+		TotalWeight: &wrappers.UInt32Value{Value: 1},
+		Clusters: []*route.WeightedCluster_ClusterWeight{
+			{
+				Name:   ClusterName(namespace, serviceName, portName),
+				Weight: &wrappers.UInt32Value{Value: 1},
+			},
+		},
+	}
+}
+
+func getVirtualHost(name, domain string, routes map[string]*route.Route) *route.VirtualHost {
+	var r []*route.Route
+
+	for _, ro := range routes {
+		r = append(r, ro)
+	}
+
+	return &route.VirtualHost{
+		Name:    name,
+		Domains: []string{domain},
+		Routes:  r,
+	}
+}
+
+func routeIngressConfiguration(name string, vhosts []*route.VirtualHost) *api.RouteConfiguration {
+	return &api.RouteConfiguration{
+		Name:         name,
+		VirtualHosts: vhosts,
+	}
+}
+
+func routeHashPolicy(cookieName string) []*route.RouteAction_HashPolicy {
+	return []*route.RouteAction_HashPolicy{{
+		PolicySpecifier: &route.RouteAction_HashPolicy_Cookie_{
+			Cookie: &route.RouteAction_HashPolicy_Cookie{
+				Name: cookieName,
+			},
+		},
+	}}
+}
+
+func retryPolicy() *route.RetryPolicy {
+	return &route.RetryPolicy{
+		RetryOn: "reset,connect-failure",
 	}
 }

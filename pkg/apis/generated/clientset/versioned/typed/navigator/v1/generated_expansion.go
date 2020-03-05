@@ -20,4 +20,6 @@ package v1
 
 type CanaryReleaseExpansion interface{}
 
+type GatewayExpansion interface{}
+
 type NexusExpansion interface{}

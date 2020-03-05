@@ -26,6 +26,14 @@ type CanaryReleaseListerExpansion interface{}
 // CanaryReleaseNamespaceLister.
 type CanaryReleaseNamespaceListerExpansion interface{}
 
+// GatewayListerExpansion allows custom methods to be added to
+// GatewayLister.
+type GatewayListerExpansion interface{}
+
+// GatewayNamespaceListerExpansion allows custom methods to be added to
+// GatewayNamespaceLister.
+type GatewayNamespaceListerExpansion interface{}
+
 // NexusListerExpansion allows custom methods to be added to
 // NexusLister.
 type NexusListerExpansion interface{}

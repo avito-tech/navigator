@@ -1,9 +1,13 @@
 package k8s
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 const (
 	WholeNamespaceName = ""
+	WholeMeshName      = "*"
 )
 
 type QualifiedName struct {
@@ -16,6 +20,14 @@ func NewQualifiedName(namespace, name string) QualifiedName {
 
 func (n QualifiedName) IsWholeNamespace() bool {
 	return n.Name == WholeNamespaceName
+}
+
+func (n QualifiedName) IsWholeMesh() bool {
+	return n.Namespace == WholeMeshName
+}
+
+func (n QualifiedName) IsNSRegexp() bool {
+	return strings.Contains(n.Namespace, "*")
 }
 
 func (n QualifiedName) WholeNamespaceKey() QualifiedName {

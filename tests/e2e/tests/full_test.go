@@ -5,9 +5,13 @@ package tests
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"os"
 	"regexp"
 	"sort"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,11 +25,13 @@ const (
 	appCount               = 3
 	defaultAppStatsTimeout = 30 * time.Second
 	defaultDeployTimeout   = 3 * time.Minute
-	statsProbesCount       = 50
+	statsProbesCount       = 60
+	canaryProbesCount      = 200
 	defaultProbePort       = 8999
 	defaultReplicasCount   = 2
 	normalizedWeight       = 100
-	wantBiasRatio          = 0.3
+	wantBiasRatio          = 0.2
+	consecutive5Xx         = 5
 )
 
 const (
@@ -33,8 +39,9 @@ const (
 )
 
 var (
-	defaultComponentList = []string{"main", "aux"}
-	defaultDiscovery     = Discovery{
+	defaultComponentList    = []string{"main", "aux"}
+	defaultComponentsProtos = map[string]string{"main": "http", "aux": "tcp"}
+	defaultDiscovery        = Discovery{
 		"test-1": map[string]map[string]bool{
 			"test-1": {WholeNamespace: true},
 			"test-2": {WholeNamespace: true},
@@ -49,6 +56,31 @@ var (
 		},
 	}
 )
+
+var (
+	enableLocality   bool
+	runningTestCases map[int]bool
+)
+
+type clusterName = string
+type serviceName = k8s.QualifiedName
+type endpointsName = k8s.QualifiedName
+
+func TestMain(m *testing.M) {
+	var runningTestCasesStr string
+	flag.BoolVar(&enableLocality, "enable-locality", true, "Test in locality-aware balancing mode")
+	flag.StringVar(&runningTestCasesStr, "cases", "", "Comma-separated list of running test case nums. If empty, run all")
+	flag.Parse()
+
+	runningTestCases = map[int]bool{}
+	for _, cs := range strings.Split(runningTestCasesStr, ",") {
+		if c, err := strconv.Atoi(cs); err == nil {
+			runningTestCases[c] = true
+		}
+	}
+
+	os.Exit(m.Run())
+}
 
 func TestBaseDeploy(t *testing.T) {
 	discovery := SetupTest(t, appCount)
@@ -94,18 +126,46 @@ func TestScale(t *testing.T) {
 	}
 
 	for i, c := range cases {
+		if !isCaseToRun(i) {
+			continue
+		}
 		err := ScaleReplicaset(defaultDeployTimeout, c.dstClusterName, c.appName, c.componentName, c.replicas)
 		if err != nil {
 			t.Fatal(err.Error())
 		}
 
-		//fmt.Printf("Sleeping\n")
 		time.Sleep(5 * time.Second) //wait for envoy to sync
-		//fmt.Printf("Wake!\n")
 
-		if err := checkCoherence(t, discovery, appCount); err != nil {
-			t.Errorf("Failed case #%d: %s", i, err.Error())
+		for _, clusterName := range getClusterList(clusterCount) {
+			wantPodWeights, err := getWantPodWeights(
+				clusterName,
+				getAppList(appCount),
+				defaultComponentList,
+				getClusterList(clusterCount),
+				nil,
+				enableLocality,
+			)
+			if err != nil {
+				t.Fatalf("Failed to get wantPodWeights: %s", err)
+			}
+			for _, appName := range getAppList(appCount) {
+				if err = CheckAppStats(
+					t,
+					clusterName,
+					appName,
+					discovery,
+					getAppList(appCount),
+					defaultComponentList,
+					wantPodWeights,
+					defaultProbePort,
+					statsProbesCount*2, //multiply by 2 to keep enough probes for more replicas
+					true,
+				); err != nil {
+					t.Errorf("Failed case #%d: %s", i, err.Error())
+				}
+			}
 		}
+
 	}
 }
 
@@ -136,6 +196,10 @@ func TestAddService(t *testing.T) {
 	}
 
 	for i, c := range cases {
+		if !isCaseToRun(i) {
+			continue
+		}
+
 		discovery := SetupTest(t, appCount)
 
 		err := CreateService(c.dstClusterName, c.appName, c.dstComponentName, c.dstComponentName, c.port, c.targetPort)
@@ -148,8 +212,20 @@ func TestAddService(t *testing.T) {
 		// but if service exists ONLY in the DIFFERENT cluster than src App, it should NOT be accessible
 		discovery.Add(c.appName, c.appName, c.dstComponentName, c.wantAccessible)
 
-		if err := checkCoherence(t, discovery, appCount); err != nil {
+		if err = checkCoherence(t, discovery, appCount); err != nil {
 			t.Errorf("Failed case #%d check full coherence: %s", i, err.Error())
+		}
+
+		wantPodWeights, err := getWantPodWeights(
+			c.srcClusterName,
+			[]string{c.appName},
+			[]string{c.dstComponentName},
+			[]string{c.dstClusterName},
+			nil,
+			enableLocality,
+		)
+		if err != nil {
+			t.Fatalf("Failed to get wantPodWeights: %s", err)
 		}
 
 		err = CheckAppStats(
@@ -159,11 +235,10 @@ func TestAddService(t *testing.T) {
 			discovery,
 			[]string{c.appName},
 			[]string{c.dstComponentName},
-			[]string{c.dstClusterName},
-			nil,
+			wantPodWeights,
 			c.port,
 			statsProbesCount,
-			false,
+			true,
 		)
 
 		if err != nil {
@@ -194,6 +269,10 @@ func TestRemoveService(t *testing.T) {
 	}
 
 	for i, c := range cases {
+		if !isCaseToRun(i) {
+			continue
+		}
+
 		discovery := SetupTest(t, appCount)
 
 		err := RemoveService(c.dstClusterName, c.appName, c.componentName)
@@ -217,6 +296,18 @@ func TestRemoveService(t *testing.T) {
 			// but if service deleted from the DIFFERENT cluster than src App, it SHOULD be accessible
 			discovery.DeclareExistingDestinationAccessibility(c.appName, c.componentName, wantAccessible)
 
+			wantPodWeights, err := getWantPodWeights(
+				c.srcClusterName,
+				getAppList(appCount),
+				defaultComponentList,
+				[]string{dstClusterName},
+				nil,
+				enableLocality,
+			)
+			if err != nil {
+				t.Fatalf("Failed to get wantPodWeights: %s", err)
+			}
+
 			for _, appName := range getAppList(appCount) {
 				err = CheckAppStats(
 					t,
@@ -225,11 +316,10 @@ func TestRemoveService(t *testing.T) {
 					discovery,
 					getAppList(appCount),
 					defaultComponentList,
-					[]string{dstClusterName},
-					nil,
+					wantPodWeights,
 					defaultProbePort,
 					statsProbesCount,
-					false,
+					true,
 				)
 				if err != nil {
 					t.Fatalf("Failed case #%d check stats: %s", i, err.Error())
@@ -248,6 +338,10 @@ func TestUpdateService(t *testing.T) {
 	}
 
 	for i, c := range cases {
+		if !isCaseToRun(i) {
+			continue
+		}
+
 		discovery := SetupTest(t, appCount)
 
 		for _, clusterName := range getClusterList(clusterCount) {
@@ -267,20 +361,31 @@ func TestUpdateService(t *testing.T) {
 				t.Errorf("Failed case #%d check full coherence: %s", i, err.Error())
 			}
 
+			wantPodWeights, err := getWantPodWeights(
+				clusterName,
+				[]string{c.appName},
+				[]string{c.componentName},
+				getClusterList(clusterCount),
+				nil,
+				enableLocality,
+			)
+			if err != nil {
+				t.Fatalf("Failed to get wantPodWeights: %s", err)
+			}
+
 			//  using discovery object, mark updated service accessible via NEW port
 			discovery.DeclareExistingDestinationAccessibility(c.appName, c.componentName, true)
-			err := CheckAppStats(
+			err = CheckAppStats(
 				t,
 				clusterName,
 				c.appName,
 				discovery,
 				[]string{c.appName},
 				[]string{c.componentName},
-				getClusterList(clusterCount),
-				nil,
+				wantPodWeights,
 				c.newPort,
 				statsProbesCount,
-				false,
+				true,
 			)
 
 			if err != nil {
@@ -304,6 +409,10 @@ func TestAddNexus(t *testing.T) {
 	}
 
 	for i, c := range cases {
+		if !isCaseToRun(i) {
+			continue
+		}
+
 		referenceDiscovery := SetupTest(t, newAppCount)
 		discoveries := []Discovery{referenceDiscovery.Copy()}
 		for _, rule := range c {
@@ -322,7 +431,7 @@ func TestAddNexus(t *testing.T) {
 			t.Fatalf("Failed to update discovery in case #%d: %s", i, err.Error())
 		}
 
-		if err := checkCoherence(t, referenceDiscovery, newAppCount); err != nil {
+		if err = checkCoherence(t, referenceDiscovery, newAppCount); err != nil {
 			t.Errorf("Failed case #%d check full coherence: %s", i, err.Error())
 		}
 	}
@@ -356,6 +465,10 @@ func TestUpdateNexus(t *testing.T) {
 	}
 
 	for i, c := range cases {
+		if !isCaseToRun(i) {
+			continue
+		}
+
 		discovery := SetupTest(t, appCount)
 
 		for _, rule := range c {
@@ -370,7 +483,7 @@ func TestUpdateNexus(t *testing.T) {
 			t.Fatalf("Failed to update discovery in case #%d: %s", i, err.Error())
 		}
 
-		if err := checkCoherence(t, discovery, appCount); err != nil {
+		if err = checkCoherence(t, discovery, appCount); err != nil {
 			t.Errorf("Failed case #%d check full coherence: %s", i, err.Error())
 		}
 	}
@@ -390,6 +503,10 @@ func TestDeleteNexus(t *testing.T) {
 	}
 
 	for i, c := range cases {
+		if !isCaseToRun(i) {
+			continue
+		}
+
 		discovery := SetupTest(t, appCount)
 
 		for _, rule := range c {
@@ -401,7 +518,7 @@ func TestDeleteNexus(t *testing.T) {
 			t.Fatalf("Failed to update discovery in case #%d: %s", i, err.Error())
 		}
 
-		if err := checkCoherence(t, discovery, appCount); err != nil {
+		if err = checkCoherence(t, discovery, appCount); err != nil {
 			t.Errorf("Failed case #%d check full coherence: %s", i, err.Error())
 		}
 	}
@@ -517,6 +634,10 @@ func TestCreateCanary(t *testing.T) {
 	}
 
 	for i, configs := range cases {
+		if !isCaseToRun(i) {
+			continue
+		}
+
 		discovery := SetupTest(t, appCount)
 		if err := checkCanary(t, configs, discovery); err != nil {
 			t.Errorf("Failed case #%d: %s", i, err.Error())
@@ -574,6 +695,10 @@ func TestUpdateCanary(t *testing.T) {
 	}
 
 	for i, configs := range cases {
+		if !isCaseToRun(i) {
+			continue
+		}
+
 		discovery := SetupTest(t, appCount)
 		if err := checkCanary(t, configs, discovery); err != nil {
 			t.Errorf("Failed case #%d: %s", i, err.Error())
@@ -628,10 +753,120 @@ func TestDeleteCanary(t *testing.T) {
 	}
 
 	for i, configs := range cases {
+		if !isCaseToRun(i) {
+			continue
+		}
+
 		discovery := SetupTest(t, appCount)
 		if err := checkCanary(t, configs, discovery); err != nil {
 			t.Errorf("Failed case #%d: %s", i, err.Error())
 		}
+	}
+}
+
+func TestOutlier(t *testing.T) {
+	if !enableLocality {
+		t.Skipf("Outlier skipped due to locality disabled")
+	}
+
+	discovery := SetupTest(t, appCount)
+	time.Sleep(time.Second * 10)
+	srcClusterName := getClusterName(1)
+	appName := getAppName(1)
+	componentName := defaultComponentList[0]
+
+	err := ScaleReplicaset(5*time.Second, srcClusterName, appName, componentName, 4)
+	if err != nil {
+		t.Fatalf("failed to scale: %s", err.Error())
+	}
+
+	getStatsCtx, _ := context.WithDeadline(context.Background(), time.Now().Add(defaultAppStatsTimeout))
+	// make request to one of pods to trigger $consecutive_5Xx responses with status code 500
+	// to make this pod marked as "outlier" by envoy
+	armStats, err := getAppStats(
+		getStatsCtx,
+		srcClusterName,
+		appName,
+		[]string{appName},
+		[]string{componentName},
+		defaultProbePort,
+		1,
+		defaultComponentsProtos,
+		fmt.Sprintf("/500%%3Fcount=%d", consecutive5Xx*2), // multiply by 2 to avoid "successful" responses due to parallel requests
+	)
+	_ = armStats
+	if err != nil {
+		t.Fatalf("failed to arm pod as outlier: %s", err.Error())
+	}
+
+	wantPodWeights, err := getWantPodWeights(
+		srcClusterName,
+		getAppList(appCount),
+		defaultComponentList,
+		getClusterList(clusterCount),
+		nil,
+		enableLocality,
+	)
+	if err != nil {
+		t.Fatalf("Failed to get wantPodWeights: %s", err)
+	}
+
+	// compute want pod weights, considering that 1 pod is unhealthy
+
+	outlierPodWeights, err := getWantPodsWeightsByCluster(
+		getClusterList(clusterCount),
+		appName,
+		componentName,
+		nil,
+		normalizedWeight,
+	)
+
+	var outlierPod string
+	// extract 1st pod from armStats response
+	for _, stat := range armStats {
+		for outlierPod = range stat.ResponsesByCluster[srcClusterName] {
+		}
+	}
+	outlierWeight := outlierPodWeights[srcClusterName][outlierPod]
+	// remove outlier pod from wanted weights due to it is excluded from balancing as it is unhealthy
+	delete(outlierPodWeights[srcClusterName], outlierPod)
+
+	// compute weights of pods it non-local clusters.
+	// weights ou unhealthy outlier pod evenly distributed across all `appName` pods in non-local clusters
+	for _, dstCluster := range getClusterList(clusterCount) {
+		if dstCluster == srcClusterName {
+			continue
+		}
+
+		for pod, _ := range outlierPodWeights[dstCluster] {
+			outlierPodWeights[dstCluster][pod] = (outlierWeight / (clusterCount - 1)) / len(outlierPodWeights[dstCluster])
+		}
+	}
+
+	wantPodWeights[appName][componentName] = outlierPodWeights
+
+	// check stats only for `appName` with outlier
+	if err = CheckAppStats(
+		t,
+		srcClusterName,
+		appName,
+		discovery,
+		getAppList(appCount),
+		defaultComponentList,
+		wantPodWeights,
+		defaultProbePort,
+		canaryProbesCount,
+		true,
+	); err != nil {
+		t.Errorf("Failed case #%d check full coherence: %s", 0, err.Error())
+	}
+
+	// wait while outlier returned to healthy state (see cluster.go BaseEjectionTime)
+	time.Sleep(10 * time.Second)
+
+	// and then ensure that ll pods returned to normal behavior
+	if err = checkCoherence(t, discovery, appCount); err != nil {
+		t.Error(err.Error())
 	}
 }
 
@@ -680,7 +915,7 @@ func checkCanary(t *testing.T, configs []canaryTestConfig, discovery Discovery) 
 		time.Sleep(2 * time.Second) //ensure navigator processed update
 	}
 
-	err := checkCoherenceCanary(t, discovery, canariesByCluster, 1000)
+	err := checkCoherenceCanary(t, discovery, canariesByCluster, canaryProbesCount)
 	if err != nil {
 		return err
 	}
@@ -699,7 +934,7 @@ func checkCanary(t *testing.T, configs []canaryTestConfig, discovery Discovery) 
 
 	time.Sleep(3 * time.Second) //ensure navigator processed update
 
-	return checkCoherenceCanary(t, discovery, canariesByCluster, 1000)
+	return checkCoherenceCanary(t, discovery, canariesByCluster, canaryProbesCount)
 }
 
 func SetupTest(t *testing.T, appCount int) Discovery {
@@ -708,7 +943,7 @@ func SetupTest(t *testing.T, appCount int) Discovery {
 		t.Fatal(err.Error())
 	}
 
-	err = Setup(defaultDeployTimeout, clusterCount, getAppList(appCount))
+	err = Setup(defaultDeployTimeout, clusterCount, getAppList(appCount), enableLocality)
 	if err != nil {
 		t.Fatalf("%s", err.Error())
 	}
@@ -732,9 +967,8 @@ func CheckAppStats(
 	appName string,
 	discovery Discovery,
 	appList,
-	componentList,
-	dstClusterNames []string,
-	canariesByCluster map[string]map[k8s.QualifiedName]*v12.CanaryRelease,
+	componentList []string,
+	wantPodWeights map[string]map[string]podWeightsByCluster,
 	port int,
 	probesCount int,
 	checkWeights bool,
@@ -747,8 +981,7 @@ func CheckAppStats(
 		discovery,
 		appList,
 		componentList,
-		dstClusterNames,
-		canariesByCluster,
+		wantPodWeights,
 		port,
 		probesCount,
 		checkWeights,
@@ -777,34 +1010,16 @@ func doCheckAppStats(
 	appName string,
 	discovery Discovery,
 	appList,
-	componentList,
-	dstClusterNames []string,
-	canariesByCluster map[string]map[k8s.QualifiedName]*v12.CanaryRelease,
+	componentList []string,
+	wantPodWeights map[string]map[string]podWeightsByCluster,
 	port int,
 	probesCount int,
 	checkWeights bool,
-) (stat ComponentStat, err error) {
+) (ComponentStat, error) {
 	getStatsCtx, _ := context.WithDeadline(ctx, time.Now().Add(defaultAppStatsTimeout))
-	stats, err := getAppStats(getStatsCtx, srcClusterName, appName, appList, componentList, port, probesCount)
+	stats, err := getAppStats(getStatsCtx, srcClusterName, appName, appList, componentList, port, probesCount, defaultComponentsProtos, "")
 	if err != nil {
 		return ComponentStat{}, fmt.Errorf("failed to fetch app stats: %s", err.Error())
-	}
-
-	type culsterName = string
-	type serviceName = k8s.QualifiedName
-	type endpointsName = k8s.QualifiedName
-	componentWeightsByServiceByCluster := map[culsterName]map[serviceName]map[endpointsName]int{}
-	for clusterName, canaries := range canariesByCluster {
-		if componentWeightsByServiceByCluster[clusterName] == nil {
-			componentWeightsByServiceByCluster[clusterName] = map[serviceName]map[endpointsName]int{}
-		}
-
-		for qn, canary := range canaries {
-			componentWeightsByServiceByCluster[clusterName][qn] = map[endpointsName]int{}
-			for _, backend := range canary.Spec.Backends {
-				componentWeightsByServiceByCluster[clusterName][qn][k8s.NewQualifiedName(backend.Namespace, backend.Name)] = backend.Weight
-			}
-		}
 	}
 
 	for _, dstAppName := range appList {
@@ -844,8 +1059,7 @@ func doCheckAppStats(
 					discovery,
 					appList,
 					componentList,
-					dstClusterNames,
-					canariesByCluster,
+					wantPodWeights,
 					port,
 					probesCount,
 					checkWeights,
@@ -853,23 +1067,23 @@ func doCheckAppStats(
 			}
 
 			wantAccessible := discovery.IsAccessible(appName, stat.AppName, stat.ComponentName)
-			WantPodsWeightsByCluster, err := getWantPodsWeightsByCluster(
-				dstClusterNames,
-				dstAppName,
-				dstComponentName,
-				componentWeightsByServiceByCluster,
-				normalizedWeight,
-			)
-
-			if err != nil {
-				return stat, fmt.Errorf("failed to get want pod names: %s", err)
+			WantPodsWeightsByCluster, ok := wantPodWeights[dstAppName][dstComponentName]
+			if !ok {
+				return stat, fmt.Errorf(
+					"wantPodWeights is not provided for app %q & component %q", dstAppName, dstComponentName,
+				)
 			}
+
+			// if wanted weights in for dstAppName & dstComponentName is explicitly set to nil,
+			// then we want this cluster NOT accessible. See getWantPodWeights()
+			wantAccessible = wantAccessible && WantPodsWeightsByCluster != nil
 
 			gotAccessible := stat.IsAccessible(WantPodsWeightsByCluster)
 
 			if wantAccessible != gotAccessible {
 				return stat, fmt.Errorf(
-					"stat for destination \"%s.%s\" has accessibility %t when want %t. \nCurrent discovery: \n\n====\n%v\n====",
+					"%s\n stat for destination \"%s.%s\" has accessibility %t when want %t. \nCurrent discovery: \n\n====\n%v====",
+					getBalancingError(dstAppName, dstComponentName, WantPodsWeightsByCluster, stat),
 					dstAppName, dstComponentName,
 					gotAccessible,
 					wantAccessible,
@@ -895,16 +1109,19 @@ func doCheckAppStats(
 		}
 	}
 
-	return stat, nil
+	return ComponentStat{}, nil
 }
+
+// podWeightsByCluster wantPodNames[dstClusterName][podName] = int(weight)
+type podWeightsByCluster map[string]map[string]int
 
 func getWantPodsWeightsByCluster(
 	dstClusterNames []string,
 	dstAppName, dstComponentName string,
-	componentWeightsByServiceByCluster map[string]map[k8s.QualifiedName]map[k8s.QualifiedName]int,
+	componentWeightsByServiceByCluster map[clusterName]map[serviceName]map[endpointsName]int,
 	normalizedWeight int,
-) (map[string]map[string]int, error) {
-	wantPodNames := map[string]map[string]int{}
+) (podWeightsByCluster, error) {
+	wantPodNames := podWeightsByCluster{}
 
 	for _, dstClusterName := range dstClusterNames {
 		backendSetWeights := componentWeightsByServiceByCluster[dstClusterName][k8s.NewQualifiedName(dstAppName, dstComponentName)]
@@ -964,19 +1181,30 @@ func getPrettyStats(clusterName, appName string, stat ComponentStat) string {
 
 func checkCoherence(t *testing.T, discovery Discovery, appCount int) error {
 	for _, clusterName := range getClusterList(clusterCount) {
+		wantPodWeights, err := getWantPodWeights(
+			clusterName,
+			getAppList(appCount),
+			defaultComponentList,
+			getClusterList(clusterCount),
+			nil,
+			enableLocality,
+		)
+		if err != nil {
+			t.Fatalf("Failed to get wantPodWeights: %s", err)
+		}
+
 		for _, appName := range getAppList(appCount) {
-			if err := CheckAppStats(
+			if err = CheckAppStats(
 				t,
 				clusterName,
 				appName,
 				discovery,
 				getAppList(appCount),
 				defaultComponentList,
-				getClusterList(clusterCount),
-				nil,
+				wantPodWeights,
 				defaultProbePort,
 				statsProbesCount,
-				false,
+				true,
 			); err != nil {
 				return err
 			}
@@ -988,16 +1216,26 @@ func checkCoherence(t *testing.T, discovery Discovery, appCount int) error {
 
 func checkCoherenceCanary(t *testing.T, discovery Discovery, canariesByCluster map[string]map[k8s.QualifiedName]*v12.CanaryRelease, probesCount int) error {
 	for _, clusterName := range getClusterList(clusterCount) {
+		wantPodWeights, err := getWantPodWeights(
+			clusterName,
+			getAppList(appCount),
+			defaultComponentList,
+			getClusterList(clusterCount),
+			canariesByCluster,
+			enableLocality,
+		)
+		if err != nil {
+			t.Fatalf("Failed to get wantPodWeights: %s", err)
+		}
 		for _, appName := range getAppList(appCount) {
-			if err := CheckAppStats(
+			if err = CheckAppStats(
 				t,
 				clusterName,
 				appName,
 				discovery,
 				getAppList(appCount),
 				defaultComponentList,
-				getClusterList(clusterCount),
-				canariesByCluster,
+				wantPodWeights,
 				defaultProbePort,
 				probesCount,
 				true,
@@ -1013,4 +1251,63 @@ func checkCoherenceCanary(t *testing.T, discovery Discovery, canariesByCluster m
 func getDataRaceWarnings(logs string) (warnings []string) {
 	re := regexp.MustCompile("(?msU)==================\nWARNING: DATA RACE\n.+\n==================")
 	return re.FindAllString(logs, -1)
+}
+
+func isCaseToRun(caseNum int) bool {
+	return len(runningTestCases) == 0 || runningTestCases[caseNum]
+}
+
+// getWantPodWeights returns pod weights indexed by appName and componentName
+func getWantPodWeights(
+	srcClusterName string,
+	appList, componentList, dstClusterNames []string,
+	canariesByCluster map[string]map[k8s.QualifiedName]*v12.CanaryRelease,
+	localityAware bool,
+) (map[string]map[string]podWeightsByCluster, error) {
+	componentWeightsByServiceByCluster := map[clusterName]map[serviceName]map[endpointsName]int{}
+	for clusterName, canaries := range canariesByCluster {
+		if componentWeightsByServiceByCluster[clusterName] == nil {
+			componentWeightsByServiceByCluster[clusterName] = map[serviceName]map[endpointsName]int{}
+		}
+
+		for qn, canary := range canaries {
+			componentWeightsByServiceByCluster[clusterName][qn] = map[endpointsName]int{}
+			for _, backend := range canary.Spec.Backends {
+				componentWeightsByServiceByCluster[clusterName][qn][k8s.NewQualifiedName(backend.Namespace, backend.Name)] = backend.Weight
+			}
+		}
+	}
+
+	wantPodWeights := map[string]map[string]podWeightsByCluster{}
+
+	for _, dstAppName := range appList {
+		wantPodWeights[dstAppName] = map[string]podWeightsByCluster{}
+		for _, dstComponentName := range componentList {
+			WantPodsWeightsByCluster, err := getWantPodsWeightsByCluster(
+				dstClusterNames,
+				dstAppName,
+				dstComponentName,
+				componentWeightsByServiceByCluster,
+				normalizedWeight,
+			)
+
+			if err != nil {
+				return nil, err
+			}
+
+			if localityAware {
+				// we want pods accessible only in local cluster
+				if _, ok := WantPodsWeightsByCluster[srcClusterName]; ok {
+					WantPodsWeightsByCluster = map[string]map[string]int{srcClusterName: WantPodsWeightsByCluster[srcClusterName]}
+				} else {
+					//if we have no wanted weights in `srcClusterName`, it we want this cluster NOT accessible
+					WantPodsWeightsByCluster = nil
+				}
+			}
+
+			wantPodWeights[dstAppName][dstComponentName] = WantPodsWeightsByCluster
+		}
+	}
+
+	return wantPodWeights, nil
 }

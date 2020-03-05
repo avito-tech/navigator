@@ -1,11 +1,11 @@
 package k8s
 
 import (
+	"sync"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/sirupsen/logrus"
-
-	"sync"
 )
 
 type Cache interface {

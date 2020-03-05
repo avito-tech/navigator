@@ -27,6 +27,7 @@ import (
 type NavigatorV1Interface interface {
 	RESTClient() rest.Interface
 	CanaryReleasesGetter
+	GatewaysGetter
 	NexusesGetter
 }
 
@@ -37,6 +38,10 @@ type NavigatorV1Client struct {
 
 func (c *NavigatorV1Client) CanaryReleases(namespace string) CanaryReleaseInterface {
 	return newCanaryReleases(c, namespace)
+}
+
+func (c *NavigatorV1Client) Gateways(namespace string) GatewayInterface {
+	return newGateways(c, namespace)
 }
 
 func (c *NavigatorV1Client) Nexuses(namespace string) NexusInterface {

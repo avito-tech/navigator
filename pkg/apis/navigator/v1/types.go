@@ -71,3 +71,32 @@ type NexusList struct {
 
 	Items []Nexus `json:"items"`
 }
+
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// Gateway is a top-level type
+type Gateway struct {
+	metav1.TypeMeta `json:",inline"`
+	// +optional
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec GatewaySpec `json:"spec,omitempty"`
+}
+
+// GatewaySpec is a Gateway spec
+type GatewaySpec struct {
+	IngressClass string `json:"ingressClass"`
+	Port         int    `json:"port"`
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// no client needed for list as it's been created in above
+type GatewayList struct {
+	metav1.TypeMeta `json:",inline"`
+	// +optional
+	metav1.ListMeta `son:"metadata,omitempty"`
+
+	Items []Gateway `json:"items"`
+}

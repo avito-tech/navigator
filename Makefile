@@ -2,7 +2,7 @@ SHELL := /bin/bash -euo pipefail
 NAVIGATOR_IMAGE?=registry.k.avito.ru/avito/navigator
 NAVIGATOR_IMAGE_INIT?=registry.k.avito.ru/avito/navigator-init
 NAVIGATOR_IMAGE_SIDECAR?=registry.k.avito.ru/avito/navigator-sidecar
-VERSION?=1.0.18
+VERSION?=1.3.0
 
 .PHONY: deps
 deps:
@@ -49,9 +49,17 @@ push-all:
 	docker push ${NAVIGATOR_IMAGE_INIT}:${VERSION}
 	docker push ${NAVIGATOR_IMAGE_SIDECAR}:${VERSION}
 
+.PHONY: prepare-for-e2e
+prepare-for-e2e:
+	./tests/e2e/setup/init-clusters.sh && ./tests/e2e/setup/build-test-rig.sh
+
 .PHONY: test-e2e
 test-e2e:
-	go test -timeout 50m -count=1 -mod vendor  -v -tags e2e_test ${FLAGS} github.com/avito-tech/navigator/tests/e2e/tests
+	go test -timeout 50m -count=1 -mod vendor  -v -tags e2e_test github.com/avito-tech/navigator/tests/e2e/tests ${FLAGS}
+
+.PHONY: test-e2e-locality-disabled
+test-e2e-locality-disabled:
+	go test -timeout 50m -count=1 -mod vendor  -v -tags e2e_test github.com/avito-tech/navigator/tests/e2e/tests --enable-locality=false ${FLAGS}
 
 .PHONY: test-unit
 test-unit:
