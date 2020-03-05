@@ -41,6 +41,15 @@ Navigator solves following problems:
 
 ## Run tests
 
+kubectl 1.15 is required
+
+Prepare env for tests (kube kind is used):
+
+```
+make prepare-for-e2e
+```
+
+Run tests:
 ```
 make test-e2e
 make test-unit

@@ -38,6 +38,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&CanaryReleaseList{},
 		&Nexus{},
 		&NexusList{},
+		&Gateway{},
+		&GatewayList{},
 	)
 
 	scheme.AddKnownTypes(

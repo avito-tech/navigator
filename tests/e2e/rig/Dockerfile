@@ -7,8 +7,8 @@ COPY ./ /navigator
 WORKDIR /navigator
 
 RUN mkdir -p /navigator/bin/ ; \
-	CGO_ENABLED=0 GOOS=linux GOFLAGS="-ldflags=-w -ldflags=-s"  go build  -mod vendor -o ./bin/probe /navigator/tests/e2e/rig/probe.go ;\
-	CGO_ENABLED=0 GOOS=linux GOFLAGS="-ldflags=-w -ldflags=-s"  go build  -mod vendor -o ./bin/probe-server /navigator/tests/e2e/rig/probe-server.go
+	CGO_ENABLED=0 GOOS=linux GOFLAGS="-ldflags=-w -ldflags=-s"  go build  -mod vendor -o ./bin/probe /navigator/tests/e2e/rig/probe/main.go ;\
+	CGO_ENABLED=0 GOOS=linux GOFLAGS="-ldflags=-w -ldflags=-s"  go build  -mod vendor -o ./bin/probe-server /navigator/tests/e2e/rig/probe-server/main.go
 
 FROM alpine
 

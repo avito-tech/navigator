@@ -184,7 +184,7 @@ spec:
   selector:
     component: aux
   ports:
-    - name: http-main-port
+    - name: main-port
       protocol: TCP
       port: 8999
       targetPort: 80
@@ -240,17 +240,13 @@ data:
         socket_address:
           address: 127.0.0.1
           port_value: 9001
-
     dynamic_resources:
-      lds_config:
-        api_config_source:
-          api_type: GRPC
-          grpc_services:
-            envoy_grpc:
-              cluster_name: navigator
       cds_config:
-        api_config_source:
-          api_type: GRPC
-          grpc_services:
-            envoy_grpc:
-              cluster_name: navigator
+        ads: {}
+      lds_config:
+        ads: {}
+      ads_config:
+        api_type: GRPC
+        grpc_services:
+          envoy_grpc:
+            cluster_name: navigator

@@ -2,9 +2,14 @@
 
 set -exo pipefail
 
-cd $(dirname "$0")
+cd "$(dirname "$0")"
 pwd
 source config.sh
+
+if [ "$ENABLE_LOCALITY" != "true" ];
+then
+  ENABLE_LOCALITY="false"
+fi
 
 export NAVIGATOR_CONFIGS=""
 for CLUSTER in ${CLUSTER_LIST};
@@ -14,8 +19,9 @@ done;
 
 for CLUSTER in ${CLUSTER_LIST};
 do
-	export KUBECONFIG="$(kind get kubeconfig-path --name="$CLUSTER")"
-	export NAVIGATOR_ADDRESS=$(kubectl get nodes -o jsonpath='{$.items[*].status.addresses[?(@.type=="InternalIP")].address}')
+	export KUBECONFIG NAVIGATOR_ADDRESS
+	KUBECONFIG="$(kind get kubeconfig-path --name="$CLUSTER")"
+	NAVIGATOR_ADDRESS=$(kubectl get nodes -o jsonpath='{$.items[*].status.addresses[?(@.type=="InternalIP")].address}')
 
 	kubectl cluster-info
 
@@ -30,6 +36,7 @@ do
 	$SED -i "s#%NAVIGATOR_IMAGE%#$NAVIGATOR_IMAGE#g"  /tmp/navigator.yaml
 	$SED -i "s#%TEST_RIG_IMAGE%#$TEST_RIG_IMAGE#g"  /tmp/navigator.yaml
 	$SED -i "s#%NAVIGATOR_NS%#$NAVIGATOR_NS#g"  /tmp/navigator.yaml
+	$SED -i "s#%ENABLE_LOCALITY%#$ENABLE_LOCALITY#g"  /tmp/navigator.yaml
 	kubectl apply -n ${NAVIGATOR_NS} -f /tmp/navigator.yaml
 
 	for NS in ${NS_LIST};
@@ -56,7 +63,7 @@ echo "waiting pods start..."
 
 for CLUSTER in ${CLUSTER_LIST};
 do
-	export KUBECONFIG="$(kind get kubeconfig-path --name="$CLUSTER")"
+	KUBECONFIG="$(kind get kubeconfig-path --name="$CLUSTER")"
 	while kubectl get po  --all-namespaces | grep -v STATUS |grep -v Running;
 	do
 		ERRNS="$(kubectl get po  --all-namespaces | grep Error | tail -n 1 | awk '{ print $1 }')"
@@ -73,7 +80,7 @@ done
 echo -e "\n\n=============\n\n"
 for CLUSTER in ${CLUSTER_LIST};
 do
-	export KUBECONFIG="$(kind get kubeconfig-path --name="$CLUSTER")"
+	KUBECONFIG="$(kind get kubeconfig-path --name="$CLUSTER")"
 	kubectl get svc -o wide --all-namespaces
 	echo -e "\n-----------\n"
 done;

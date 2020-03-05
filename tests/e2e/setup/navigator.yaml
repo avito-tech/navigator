@@ -23,7 +23,7 @@ spec:
     - name: navigator
       image: %NAVIGATOR_IMAGE%:%VERSION%
       imagePullPolicy: Never
-      command: ["navigator", "--log-level", "info"]
+      command: ["navigator", "--log-level", "info", "--enable-locality=%ENABLE_LOCALITY%"]
       args: [%NAVIGATOR_CONFIGS%]
       workingDir: /config
       volumeMounts:

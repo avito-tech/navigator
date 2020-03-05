@@ -24,3 +24,12 @@ spec:
     name: "" # all services in service-releases NS
   - namespace: "payments"
     name: "redis" # particular service redis in payments namespace
+
+---
+apiVersion: "navigator.avito.ru/v1"
+kind: Gateway
+metadata:
+  name: ingress-services
+spec:
+  ingressClass: ""
+  port: 8080

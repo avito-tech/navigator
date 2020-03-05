@@ -14,6 +14,10 @@ type DynamicConfiger interface {
 	SetClusterName(name string)
 }
 
+type LocalityEnabler interface {
+	SetLocalityEnabled(bool)
+}
+
 type DynamicConfig struct {
 	DynamicClusterName string
 }
@@ -29,6 +33,16 @@ func WithClusterName(name string) FuncOpt {
 			return
 		}
 		r.SetClusterName(name)
+	}
+}
+
+func WithLocalityEnabled() FuncOpt {
+	return func(resource interface{}) {
+		r, ok := resource.(LocalityEnabler)
+		if !ok {
+			return
+		}
+		r.SetLocalityEnabled(true)
 	}
 }
 

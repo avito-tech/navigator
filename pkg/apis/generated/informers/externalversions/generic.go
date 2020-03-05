@@ -55,6 +55,8 @@ func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource
 	// Group=navigator.avito.ru, Version=v1
 	case v1.SchemeGroupVersion.WithResource("canaryreleases"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Navigator().V1().CanaryReleases().Informer()}, nil
+	case v1.SchemeGroupVersion.WithResource("gateways"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Navigator().V1().Gateways().Informer()}, nil
 	case v1.SchemeGroupVersion.WithResource("nexuses"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Navigator().V1().Nexuses().Informer()}, nil
 

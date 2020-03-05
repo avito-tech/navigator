@@ -1,204 +1,176 @@
-// Copyright © 2018 Heptio
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package resources
 
 import (
 	"fmt"
-	"sort"
 	"sync"
 
-	"github.com/avito-tech/navigator/pkg/grpc"
-	"github.com/avito-tech/navigator/pkg/k8s"
-
 	api "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/listener"
+	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	listener "github.com/envoyproxy/go-control-plane/envoy/api/v2/listener"
 	http "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/http_connection_manager/v2"
 	tcp "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/tcp_proxy/v2"
 	"github.com/envoyproxy/go-control-plane/pkg/cache"
-	"github.com/envoyproxy/go-control-plane/pkg/util"
+	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"github.com/gogo/protobuf/proto"
-	"github.com/gogo/protobuf/types"
+	"github.com/golang/protobuf/ptypes"
+	"github.com/golang/protobuf/ptypes/any"
+	"github.com/golang/protobuf/ptypes/duration"
+	"github.com/golang/protobuf/ptypes/wrappers"
+
+	"github.com/avito-tech/navigator/pkg/k8s"
 )
 
-type ListenerByCluster struct {
-	ClusterID string
-	Listener  *api.Listener
-}
+const (
+	GatewayListenerPrefix = "~~gateway"
+)
 
-// ListenerCache manages the contents of the gRPC LDS cache.
 type ListenerCache struct {
+	muUpdate sync.RWMutex
+
 	DynamicConfig
 	HealthCheckConfig
 
-	observable
-
-	mu                     sync.Mutex
-	listenerNamesByService map[k8s.QualifiedName][]ListenerByCluster
+	*BranchedResourceCache
+	isGatewayOnly bool
 }
 
-type clusterListenerCache struct {
-	*ListenerCache
-	clusterID string
-}
-
-// NewListenerCache returns an instance of a ListenerCache
 func NewListenerCache(opts ...FuncOpt) *ListenerCache {
 	l := &ListenerCache{
-		listenerNamesByService: map[k8s.QualifiedName][]ListenerByCluster{},
+		BranchedResourceCache: NewBranchedResourceCache(cache.ListenerType),
 	}
+
 	l.DynamicClusterName = DefaultDynamicClusterName
-	l.EnableHealthCheck = false
 	SetOpts(l, opts...)
+
+	static := []NamedProtoMessage{}
+	if l.EnableHealthCheck {
+		static = append(static, l.healthListener())
+	}
+	l.SetStaticResources(static)
 	return l
 }
 
-func (c *ListenerCache) Get(clusterID string) (resource grpc.Resource, ok bool) {
-	clustered := &clusterListenerCache{ListenerCache: c, clusterID: clusterID}
-	return clustered, true
+func (c *ListenerCache) UpdateServices(updated, deleted []*k8s.Service) {
+
+	c.muUpdate.Lock()
+	defer c.muUpdate.Unlock()
+
+	if c.isGatewayOnly {
+		return
+	}
+
+	updatedResource := map[string][]NamedProtoMessage{}
+	deletedResources := map[string][]NamedProtoMessage{}
+
+	for _, u := range updated {
+		c.getServiceListeners(updatedResource, u)
+	}
+	for _, d := range deleted {
+		c.getServiceListeners(deletedResources, d)
+	}
+
+	c.UpdateBranchedResources(updatedResource, deletedResources)
 }
 
-func (c *ListenerCache) AddService(service *k8s.Service) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *ListenerCache) UpdateIngresses(updated map[k8s.QualifiedName]*k8s.Ingress) {
+	// do nothing
+}
 
-	serviceKey := service.Key()
-	c.removeServiceByName(serviceKey)
+func (c *ListenerCache) UpdateGateway(gw *k8s.Gateway) {
+	c.muUpdate.Lock()
+	defer c.muUpdate.Unlock()
 
+	if !c.isGatewayOnly {
+		c.isGatewayOnly = true
+		c.RenewResourceCache()
+	}
+	updatedResource := map[string][]NamedProtoMessage{}
+	c.getGatewayListeners(updatedResource, gw)
+	c.UpdateBranchedResources(updatedResource, nil)
+}
+
+func (c *ListenerCache) healthListener() *api.Listener {
+	return &api.Listener{
+		Name:                          c.HealthCheckName,
+		Address:                       socketAddress("0.0.0.0", c.HealthCheckPort),
+		PerConnectionBufferLimitBytes: &wrappers.UInt32Value{Value: 32768}, // 32 Kb
+		FilterChains: []*listener.FilterChain{{
+			Filters: []*listener.Filter{{
+				Name: wellknown.HTTPConnectionManager,
+				ConfigType: &listener.Filter_TypedConfig{
+					TypedConfig: makeAny(&http.HttpConnectionManager{
+						NormalizePath:     &wrappers.BoolValue{Value: true},
+						MergeSlashes:      true,
+						GenerateRequestId: &wrappers.BoolValue{Value: false},
+						StreamIdleTimeout: &duration.Duration{Seconds: 300},
+						StatPrefix:        c.HealthCheckName,
+						HttpFilters: []*http.HttpFilter{{
+							Name: wellknown.Router,
+						}},
+						RouteSpecifier: &http.HttpConnectionManager_Rds{
+							Rds: &http.Rds{
+								RouteConfigName: c.HealthCheckName,
+								ConfigSource:    configSource(c.DynamicClusterName),
+							},
+						},
+					}),
+				},
+			}},
+		}},
+	}
+}
+
+func (c *ListenerCache) getGatewayListeners(storage map[string][]NamedProtoMessage, gateway *k8s.Gateway) {
+	clusterID := gateway.ClusterID
+	if _, ok := storage[clusterID]; !ok {
+		storage[clusterID] = []NamedProtoMessage{}
+	}
+	listenerConf := gatewayListener("0.0.0.0", gateway.Port, c.DynamicClusterName)
+	storage[clusterID] = append(storage[clusterID], listenerConf)
+}
+
+func (c *ListenerCache) getServiceListeners(storage map[string][]NamedProtoMessage, service *k8s.Service) {
 	for _, p := range service.Ports {
 		if p.Protocol != k8s.ProtocolTCP {
 			continue
 		}
 		for _, clusterIP := range service.ClusterIPs {
-			//clusterListeners := c.values[clusterIP.ClusterID]
-			//if clusterListeners == nil {
-			//	clusterListeners = map[string]*api.Listener{}
-			//	c.values[clusterIP.ClusterID] = clusterListeners
-			//}
-
-			//name := ListenerName(clusterIP.IP, p.Port)
-
+			clusterID := clusterIP.ClusterID
 			var clusterListener *api.Listener
 			switch getClusterType(p.Name) {
 			case HTTPCluster:
-				clusterListener = httpListener(clusterIP, p, c.DynamicClusterName)
+				clusterListener = httpListener(clusterIP, p, service, c.DynamicClusterName)
 			case TCPCluster:
 				clusterListener = tcpListener(clusterIP, p, service)
 			}
 
-			c.listenerNamesByService[serviceKey] = append(
-				c.listenerNamesByService[serviceKey],
-				ListenerByCluster{ClusterID: clusterIP.ClusterID, Listener: clusterListener},
-			)
-		}
-
-	}
-
-	return nil
-}
-
-func (c *ListenerCache) RemoveService(serviceKey k8s.QualifiedName) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.removeServiceByName(serviceKey)
-	return nil
-}
-
-func (c *ListenerCache) removeServiceByName(serviceKey k8s.QualifiedName) {
-	c.listenerNamesByService[serviceKey] = nil
-}
-
-func (c *clusterListenerCache) getNameToListenersMapping() map[string]map[string]*api.Listener {
-	mapping := make(map[string]map[string]*api.Listener)
-	for _, v := range c.listenerNamesByService {
-		for _, l := range v {
-			if _, ok := mapping[l.ClusterID]; !ok {
-				mapping[l.ClusterID] = make(map[string]*api.Listener)
+			if _, ok := storage[clusterID]; !ok {
+				storage[clusterID] = []NamedProtoMessage{}
 			}
-			mapping[l.ClusterID][l.Listener.Name] = l.Listener
+			storage[clusterID] = append(storage[clusterID], clusterListener)
 		}
 	}
-
-	return mapping
-}
-
-// Contents returns a copy of the cache's contents.
-func (c *clusterListenerCache) Contents() []proto.Message {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	var values []proto.Message
-	health := healthListener(c.HealthCheckPort, c.HealthCheckName, c.DynamicClusterName)
-	values = append(values, health)
-	for _, v := range c.getNameToListenersMapping()[c.clusterID] {
-		values = append(values, v)
-	}
-	sort.Stable(listenersByName(values))
-	return values
-}
-
-func (c *clusterListenerCache) Query(names []string) []proto.Message {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	mapping := c.getNameToListenersMapping()
-
-	var values []proto.Message
-	for _, n := range names {
-		v, ok := mapping[c.clusterID][n]
-		if ok {
-			values = append(values, v)
-		}
-		if n == c.HealthCheckName {
-			health := healthListener(c.HealthCheckPort, c.HealthCheckName, c.DynamicClusterName)
-			values = append(values, health)
-		}
-	}
-	sort.Stable(listenersByName(values))
-	return values
-}
-
-func (*ListenerCache) TypeURL() string { return cache.ListenerType }
-
-type listenersByName []proto.Message
-
-func (l listenersByName) Len() int      { return len(l) }
-func (l listenersByName) Swap(i, j int) { l[i], l[j] = l[j], l[i] }
-func (l listenersByName) Less(i, j int) bool {
-	return l[i].(*api.Listener).Name < l[j].(*api.Listener).Name
 }
 
 func tcpListener(clusterIP k8s.Address, port k8s.Port, service *k8s.Service) *api.Listener {
-	name := ListenerName(clusterIP.IP, port.Port)
+	name := ListenerNameFromService(service.Namespace, service.Name, port.Port)
 
 	return &api.Listener{
 		Name:    name,
-		Address: *socketAddress(clusterIP.IP, port.Port),
+		Address: socketAddress(clusterIP.IP, port.Port),
 		DeprecatedV1: &api.Listener_DeprecatedV1{
-			BindToPort: &types.BoolValue{
+			BindToPort: &wrappers.BoolValue{
 				Value: false,
 			},
 		},
-		FilterChains: []listener.FilterChain{{
-			Filters: []listener.Filter{{
-				Name: util.TCPProxy,
+		FilterChains: []*listener.FilterChain{{
+			Filters: []*listener.Filter{{
+				Name: wellknown.TCPProxy,
 				ConfigType: &listener.Filter_TypedConfig{
-					TypedConfig: any(&tcp.TcpProxy{
+					TypedConfig: makeAny(&tcp.TcpProxy{
 						StatPrefix: name,
 						ClusterSpecifier: &tcp.TcpProxy_Cluster{
-							Cluster: TCPClusterName(service.Namespace, service.Name, port.Name),
+							Cluster: ClusterName(service.Namespace, service.Name, port.Name),
 						},
 					}),
 				},
@@ -207,26 +179,31 @@ func tcpListener(clusterIP k8s.Address, port k8s.Port, service *k8s.Service) *ap
 	}
 }
 
-func httpListener(clusterIP k8s.Address, port k8s.Port, dynamicClusterName string) *api.Listener {
-	name := ListenerName(clusterIP.IP, port.Port)
+func httpListener(clusterIP k8s.Address, port k8s.Port, service *k8s.Service, dynamicClusterName string) *api.Listener {
+	name := ListenerNameFromService(service.Namespace, service.Name, port.Port)
 
 	return &api.Listener{
 		Name:    name,
-		Address: *socketAddress(clusterIP.IP, port.Port),
+		Address: socketAddress(clusterIP.IP, port.Port),
 		DeprecatedV1: &api.Listener_DeprecatedV1{
-			BindToPort: &types.BoolValue{
+			BindToPort: &wrappers.BoolValue{
 				Value: false,
 			},
 		},
-		FilterChains: []listener.FilterChain{{
-			Filters: []listener.Filter{{
-				Name: util.HTTPConnectionManager,
+		FilterChains: []*listener.FilterChain{{
+			Filters: []*listener.Filter{{
+				Name: wellknown.HTTPConnectionManager,
 				ConfigType: &listener.Filter_TypedConfig{
 
-					TypedConfig: any(&http.HttpConnectionManager{
+					TypedConfig: makeAny(&http.HttpConnectionManager{
+						NormalizePath: &wrappers.BoolValue{Value: true},
+						MergeSlashes:  true,
+						UpgradeConfigs: []*http.HttpConnectionManager_UpgradeConfig{{
+							UpgradeType: "websocket",
+						}},
 						StatPrefix: name,
 						HttpFilters: []*http.HttpFilter{{
-							Name: util.Router,
+							Name: wellknown.Router,
 						}},
 						RouteSpecifier: &http.HttpConnectionManager_Rds{
 							Rds: &http.Rds{
@@ -241,23 +218,27 @@ func httpListener(clusterIP k8s.Address, port k8s.Port, dynamicClusterName strin
 	}
 }
 
-func healthListener(port int, name, dynamicClusterName string) *api.Listener {
+func gatewayListener(address string, port int, dynamicClusterName string) *api.Listener {
 	return &api.Listener{
-		Name:    name,
-		Address: *socketAddress("0.0.0.0", port),
-		FilterChains: []listener.FilterChain{{
-			Filters: []listener.Filter{{
-				Name: util.HTTPConnectionManager,
+		Name:    fmt.Sprintf("%s_%d", GatewayListenerPrefix, port),
+		Address: socketAddress(address, port),
+		FilterChains: []*listener.FilterChain{{
+			Filters: []*listener.Filter{{
+				Name: wellknown.HTTPConnectionManager,
 				ConfigType: &listener.Filter_TypedConfig{
-
-					TypedConfig: any(&http.HttpConnectionManager{
-						StatPrefix: name,
+					TypedConfig: makeAny(&http.HttpConnectionManager{
+						NormalizePath: &wrappers.BoolValue{Value: true},
+						MergeSlashes:  true,
+						UpgradeConfigs: []*http.HttpConnectionManager_UpgradeConfig{{
+							UpgradeType: "websocket",
+						}},
+						StatPrefix: GatewayListenerPrefix,
 						HttpFilters: []*http.HttpFilter{{
-							Name: util.Router,
+							Name: wellknown.Router,
 						}},
 						RouteSpecifier: &http.HttpConnectionManager_Rds{
 							Rds: &http.Rds{
-								RouteConfigName: name,
+								RouteConfigName: GatewayListenerPrefix,
 								ConfigSource:    configSource(dynamicClusterName),
 							},
 						},
@@ -266,7 +247,6 @@ func healthListener(port int, name, dynamicClusterName string) *api.Listener {
 			}},
 		}},
 	}
-
 }
 
 // socketAddress creates a new TCP core.Address.
@@ -274,7 +254,7 @@ func socketAddress(address string, port int) *core.Address {
 	return &core.Address{
 		Address: &core.Address_SocketAddress{
 			SocketAddress: &core.SocketAddress{
-				Protocol: core.TCP,
+				Protocol: core.SocketAddress_TCP,
 				Address:  address,
 				PortSpecifier: &core.SocketAddress_PortValue{
 					PortValue: uint32(port),
@@ -284,14 +264,14 @@ func socketAddress(address string, port int) *core.Address {
 	}
 }
 
-func any(pb proto.Message) *types.Any {
-	any, err := types.MarshalAny(pb)
+func makeAny(pb proto.Message) *any.Any {
+	any, err := ptypes.MarshalAny(pb)
 	if err != nil {
 		panic(err.Error())
 	}
 	return any
 }
 
-func ListenerName(ip string, port int) string {
-	return fmt.Sprintf("%s_%d", ip, port)
+func ListenerNameFromService(serviceNamespace, serviceName string, port int) string {
+	return fmt.Sprintf("%s_%s_%d", serviceNamespace, serviceName, port)
 }

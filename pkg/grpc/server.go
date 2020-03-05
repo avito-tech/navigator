@@ -14,17 +14,13 @@ package grpc
 
 import (
 	"context"
-	"fmt"
 
-	"github.com/prometheus/client_golang/prometheus"
-
+	xds "github.com/envoyproxy/go-control-plane/envoy/api/v2"
+	ads "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
+	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-
-	v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -32,9 +28,9 @@ const (
 	grpcMaxConcurrentStreams = 1 << 20
 )
 
-var grpcMetrics = grpc_prometheus.NewServerMetrics(func(opts *prometheus.CounterOpts) {
-	opts.Name = fmt.Sprintf("navigator_%s", opts.Name)
-})
+// var grpcMetrics = grpc_prometheus.NewServerMetrics(func(opts *prometheus.CounterOpts) {
+// 	opts.Name = fmt.Sprintf("navigator_%s", opts.Name)
+// })
 
 // NewAPI returns a *grpc.Server which responds to the Envoy v2 xDS gRPC API.
 func NewAPI(log logrus.FieldLogger, resources ResourceGetter) *grpc.Server {
@@ -49,22 +45,22 @@ func NewAPI(log logrus.FieldLogger, resources ResourceGetter) *grpc.Server {
 		// so set it the limit similar to envoyproxy/go-control-plane#70.
 		grpc.MaxConcurrentStreams(grpcMaxConcurrentStreams),
 		// Add prometheus instrumentation
-		grpc.StreamInterceptor(grpcMetrics.StreamServerInterceptor()),
-		grpc.UnaryInterceptor(grpcMetrics.UnaryServerInterceptor()),
+		// grpc.StreamInterceptor(grpcMetrics.StreamServerInterceptor()),
+		// grpc.UnaryInterceptor(grpcMetrics.UnaryServerInterceptor()),
 	}
 	g := grpc.NewServer(opts...)
 	s := &grpcServer{
-		xdsHandler{
-			FieldLogger: log,
-			resources:   resources,
+		xdsHandler: xdsHandler{
+			logger:    log,
+			resources: resources,
 		},
 	}
-
-	v2.RegisterClusterDiscoveryServiceServer(g, s)
-	v2.RegisterEndpointDiscoveryServiceServer(g, s)
-	v2.RegisterListenerDiscoveryServiceServer(g, s)
-	v2.RegisterRouteDiscoveryServiceServer(g, s)
-	grpc_prometheus.Register(g)
+	xds.RegisterClusterDiscoveryServiceServer(g, s)
+	xds.RegisterEndpointDiscoveryServiceServer(g, s)
+	xds.RegisterListenerDiscoveryServiceServer(g, s)
+	xds.RegisterRouteDiscoveryServiceServer(g, s)
+	ads.RegisterAggregatedDiscoveryServiceServer(g, s)
+	// grpc_prometheus.Register(g)
 	return g
 }
 
@@ -73,42 +69,58 @@ type grpcServer struct {
 	xdsHandler
 }
 
-func (s *grpcServer) FetchClusters(_ context.Context, req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
+func (s *grpcServer) FetchClusters(_ context.Context, req *xds.DiscoveryRequest) (*xds.DiscoveryResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "FetchClusters unimplemented")
 }
 
-func (s *grpcServer) FetchEndpoints(_ context.Context, req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
+func (s *grpcServer) FetchEndpoints(_ context.Context, req *xds.DiscoveryRequest) (*xds.DiscoveryResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "FetchEndpoints unimplemented")
 }
 
-func (s *grpcServer) FetchListeners(_ context.Context, req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
+func (s *grpcServer) FetchListeners(_ context.Context, req *xds.DiscoveryRequest) (*xds.DiscoveryResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "FetchListeners unimplemented")
 }
 
-func (s *grpcServer) FetchRoutes(_ context.Context, req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
+func (s *grpcServer) FetchRoutes(_ context.Context, req *xds.DiscoveryRequest) (*xds.DiscoveryResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "FetchListeners unimplemented")
 }
 
-func (s *grpcServer) StreamClusters(srv v2.ClusterDiscoveryService_StreamClustersServer) error {
+func (s *grpcServer) StreamClusters(srv xds.ClusterDiscoveryService_StreamClustersServer) error {
 	return s.stream(srv)
 }
 
-func (s *grpcServer) StreamEndpoints(srv v2.EndpointDiscoveryService_StreamEndpointsServer) error {
+func (s *grpcServer) StreamEndpoints(srv xds.EndpointDiscoveryService_StreamEndpointsServer) error {
 	return s.stream(srv)
 }
 
-func (s *grpcServer) StreamListeners(srv v2.ListenerDiscoveryService_StreamListenersServer) error {
+func (s *grpcServer) StreamListeners(srv xds.ListenerDiscoveryService_StreamListenersServer) error {
 	return s.stream(srv)
 }
 
-func (s *grpcServer) StreamRoutes(srv v2.RouteDiscoveryService_StreamRoutesServer) error {
+func (s *grpcServer) StreamRoutes(srv xds.RouteDiscoveryService_StreamRoutesServer) error {
 	return s.stream(srv)
 }
 
-func (s *grpcServer) DeltaClusters(v2.ClusterDiscoveryService_DeltaClustersServer) error {
+func (s *grpcServer) DeltaClusters(xds.ClusterDiscoveryService_DeltaClustersServer) error {
 	return status.Errorf(codes.Unimplemented, "IncrementalClusters unimplemented")
 }
 
-func (s *grpcServer) DeltaRoutes(v2.RouteDiscoveryService_DeltaRoutesServer) error {
+func (s *grpcServer) DeltaRoutes(xds.RouteDiscoveryService_DeltaRoutesServer) error {
 	return status.Errorf(codes.Unimplemented, "IncrementalRoutes unimplemented")
+}
+
+func (s *grpcServer) DeltaEndpoints(xds.EndpointDiscoveryService_DeltaEndpointsServer) error {
+	return status.Errorf(codes.Unimplemented, "IncrementalEndpoints unimplemented")
+}
+
+func (s *grpcServer) DeltaListeners(xds.ListenerDiscoveryService_DeltaListenersServer) error {
+	return status.Errorf(codes.Unimplemented, "IncrementalListeners unimplemented")
+}
+
+func (s *grpcServer) StreamAggregatedResources(srv ads.AggregatedDiscoveryService_StreamAggregatedResourcesServer) error {
+	return s.stream(srv)
+}
+
+func (s *grpcServer) DeltaAggregatedResources(ads.AggregatedDiscoveryService_DeltaAggregatedResourcesServer) error {
+	return status.Errorf(codes.Unimplemented, "incremental aggregated resources unimplemented")
 }

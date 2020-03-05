@@ -1,6 +1,11 @@
 package k8s
 
-import "github.com/stretchr/testify/mock"
+import (
+	"github.com/stretchr/testify/mock"
+	"k8s.io/api/extensions/v1beta1"
+
+	navigatorV1 "github.com/avito-tech/navigator/pkg/apis/navigator/v1"
+)
 
 type MockCache struct {
 	mock.Mock
@@ -65,8 +70,16 @@ func (mn *MockNotifier) NotifyServicesUpdated(updatedServiceKeys []QualifiedName
 	mn.Called(updatedServiceKeys)
 }
 
-func (mn *MockNotifier) NotifyNexusesUpdated(updatedAppNames []string) {
-	mn.Called(updatedAppNames)
+func (mn *MockNotifier) NotifyNexusesUpdated(updatedAppNames []string, isGateway bool) {
+	mn.Called(updatedAppNames, isGateway)
+}
+
+func (mn *MockNotifier) NotifyGatewayUpdated(updatedGateway *Gateway, deleted bool) {
+	mn.Called(updatedGateway, deleted)
+}
+
+func (mn *MockNotifier) NotifyIngressUpdated(updatedIngress *Ingress) {
+	mn.Called(updatedIngress)
 }
 
 type MockServiceNotifier struct {
@@ -81,8 +94,24 @@ type MockNexusNotifier struct {
 	mock.Mock
 }
 
-func (mn *MockNexusNotifier) NotifyNexusesUpdated(updatedAppNames []string) {
-	mn.Called(updatedAppNames)
+func (mn *MockNexusNotifier) NotifyNexusesUpdated(updatedAppNames []string, isGateway bool) {
+	mn.Called(updatedAppNames, isGateway)
+}
+
+type MockIngressNotifier struct {
+	mock.Mock
+}
+
+func (mn *MockIngressNotifier) NotifyIngressUpdated(updatedIngress *Ingress) {
+	mn.Called(updatedIngress)
+}
+
+type MockGatewayNotifier struct {
+	mock.Mock
+}
+
+func (mn *MockGatewayNotifier) NotifyGatewayUpdated(updatedGateway *Gateway, deleted bool) {
+	mn.Called(updatedGateway, deleted)
 }
 
 type MockServiceEndpointsUpdater struct {
@@ -105,4 +134,57 @@ func (mnc *MockNexusCache) Update(appName, version string, services []QualifiedN
 func (mnc *MockNexusCache) GetSnapshot() (map[string]Nexus, map[QualifiedName][]string) {
 	args := mnc.Called()
 	return args.Get(0).(map[string]Nexus), args.Get(1).(map[QualifiedName][]string)
+}
+
+type MockIngressCache struct {
+	mock.Mock
+}
+
+func (mic *MockIngressCache) Update(clusterID string, ingress *v1beta1.Ingress, ports map[string]map[int]string) *Ingress {
+	args := mic.Called(clusterID, ingress, ports)
+	return args.Get(0).(*Ingress)
+}
+
+func (mic *MockIngressCache) Remove(clusterID string, ingress *v1beta1.Ingress) *Ingress {
+	args := mic.Called(clusterID, ingress)
+	return args.Get(0).(*Ingress)
+}
+
+func (mic *MockIngressCache) GetByClass(clusterID string, class string) map[QualifiedName]*Ingress {
+	args := mic.Called(clusterID, class)
+	return args.Get(0).(map[QualifiedName]*Ingress)
+}
+
+func (mic *MockIngressCache) GetServicesByClass(clusterID string, class string) []QualifiedName {
+	args := mic.Called(clusterID, class)
+	return args.Get(0).([]QualifiedName)
+}
+
+func (mic *MockIngressCache) GetClusterIDsForIngress(qn QualifiedName, class string) []string {
+	args := mic.Called(qn, class)
+	return args.Get(0).([]string)
+}
+
+func (mic *MockIngressCache) UpdateServicePort(clusterID string, namespace string, name string, ports []Port) []*Ingress {
+	args := mic.Called(clusterID, namespace, name, ports)
+	return args.Get(0).([]*Ingress)
+}
+
+type MockGatewayCache struct {
+	mock.Mock
+}
+
+func (mgc *MockGatewayCache) Update(clusterID string, gateway *navigatorV1.Gateway) *Gateway {
+	args := mgc.Called(clusterID, gateway)
+	return args.Get(0).(*Gateway)
+}
+
+func (mgc *MockGatewayCache) Delete(clusterID string, gateway *navigatorV1.Gateway) *Gateway {
+	args := mgc.Called(clusterID, gateway)
+	return args.Get(0).(*Gateway)
+}
+
+func (mgc *MockGatewayCache) GatewaysByClass(cluster, ingressClass string) []*Gateway {
+	args := mgc.Called(cluster, ingressClass)
+	return args.Get(0).([]*Gateway)
 }

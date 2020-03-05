@@ -36,11 +36,18 @@ type TestEnv struct {
 	clusterNames []string
 }
 
-func Setup(timeout time.Duration, clusterCount int, appList []string) error {
+func Setup(timeout time.Duration, clusterCount int, appList []string, enableLocality bool) error {
 	log.Printf("Deploy services...\n")
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	out, err := runScript(ctx, clusterCount, appList, "../setup/deploy.sh")
+	enableLocalityString := map[bool]string{true: "true", false: "false"}[enableLocality]
+	out, err := runScript(
+		ctx,
+		clusterCount,
+		appList,
+		map[string]string{"ENABLE_LOCALITY": enableLocalityString},
+		"../setup/deploy.sh",
+	)
 	if err != nil {
 		log.Printf("Deploy services:\n%s\n", out)
 		return fmt.Errorf("failed to deploy services: %s", err.Error())
@@ -54,7 +61,7 @@ func Clean(timeout time.Duration, clusterCount int, appList []string) error {
 	log.Printf("Cleaning services...\n")
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	out, err := runScript(ctx, clusterCount, appList, "../setup/clean.sh")
+	out, err := runScript(ctx, clusterCount, appList, nil, "../setup/clean.sh")
 	if err != nil {
 		log.Printf("\n%s\n=================\n", out)
 		return fmt.Errorf("failed to clean services: %s", err.Error())
@@ -80,11 +87,15 @@ func UpdateDiscovery(clusterCount int, discoveries []Discovery) error {
 	return nil
 }
 
-func runScript(ctx context.Context, clusterCount int, appList []string, scriptPath string) (out []byte, err error) {
+func runScript(ctx context.Context, clusterCount int, appList []string, env map[string]string, scriptPath string) (out []byte, err error) {
 	cmd := exec.CommandContext(ctx, "bash", scriptPath)
 	additionalEnv := []string{
 		fmt.Sprintf("CLUSTER_COUNT=%d", clusterCount),
 		fmt.Sprintf("NS_LIST=%s", strings.Join(appList, " ")),
+	}
+
+	for k, v := range env {
+		additionalEnv = append(additionalEnv, fmt.Sprintf(fmt.Sprintf("%s=%s", k, v)))
 	}
 
 	cmd.Env = append(os.Environ(), additionalEnv...)
@@ -360,13 +371,26 @@ func getNormalizedWeights(podsWeightsByCluster map[string]map[string]int, totalP
 	return normalizedWeights
 }
 
-func getAppStats(ctx context.Context, clusterName, appName string, appList, componentList []string, port, count int) (stats map[string]ComponentStat, err error) {
-	appListString := "&appList=" + strings.Join(appList, "&appList=")
-	componentListString := "&componentList=" + strings.Join(componentList, "&componentList=")
+func getAppStats(ctx context.Context, clusterName, appName string, appList, componentList []string, port, count int, componentsProtos map[string]string, uri string) (stats map[string]ComponentStat, err error) {
+	componentProtosChunks := []string{}
+	for c, p := range componentsProtos {
+		componentProtosChunks = append(componentProtosChunks, fmt.Sprintf("%s:%s", c, p))
+	}
+	componentProtosString := strings.Join(componentProtosChunks, "&componentsProtos=")
+	appListString := strings.Join(appList, "&appList=")
+	componentListString := strings.Join(componentList, "&componentList=")
+	url := fmt.Sprintf("http://127.0.0.1?count=%d&appList=%s&componentList=%s&componentsProtos=%s&probePort=%d&url=%s",
+		count,
+		appListString,
+		componentListString,
+		componentProtosString,
+		port,
+		uri,
+	)
 	cmd := exec.CommandContext(
 		ctx, "bash", "../setup/exec.sh",
 		"-n", appName, "exec", "-c", "c", "curl", "--", "curl", "-s",
-		fmt.Sprintf("http://127.0.0.1?count=%d&%s&%s&probePort=%d", count, appListString, componentListString, port),
+		url,
 	)
 	additionalEnv := []string{
 		fmt.Sprintf("CLUSTER=%s", clusterName),
@@ -531,57 +555,6 @@ func WaitPodsStarted(ctx context.Context, clusterName, appName string) error {
 			}
 		}
 	}
-}
-
-func WaitNamespaceDeleted(ctx context.Context, clusterName, namespace string) error {
-	cs, err := getClientsetByClusterName(clusterName)
-	if err != nil {
-		return err
-	}
-
-	checker := func() (removed bool, err error) {
-		ns, err := cs.CoreV1().Namespaces().Get(namespace, metav1.GetOptions{})
-		if err != nil {
-			return false, err
-		}
-
-		return ns == nil, nil
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("NS, but timeout exeeded")
-		case <-time.After(podWaitCheckInterval):
-			started, err := checker()
-			if err != nil {
-				return err
-			}
-			if started {
-				return nil
-			}
-		}
-	}
-}
-
-func RemoveNamespace(timeout time.Duration, clusterName, namespace string) error {
-	cs, err := getClientsetByClusterName(clusterName)
-	if err != nil {
-		return err
-	}
-
-	err = cs.CoreV1().Namespaces().Delete(namespace, &metav1.DeleteOptions{GracePeriodSeconds: new(int64)})
-	if err != nil {
-		return fmt.Errorf("failed to delete namespace: %s", err.Error())
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	err = WaitNamespaceDeleted(ctx, clusterName, namespace)
-	if err != nil {
-		return fmt.Errorf("failed to delete NS %q in cluster %q: %s", namespace, clusterName, err.Error())
-	}
-	return nil
 }
 
 func CreateService(clusterName, appName, serviceName, component string, port, targetPort int) error {

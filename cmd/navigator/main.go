@@ -16,6 +16,7 @@ func main() {
 	flag.BoolVar(&config.LogJSONFormatter, "log-json", false, "Enable JSON formatter for logger")
 	flag.BoolVar(&config.EnableProfiling, "profiling", false, "Enable pprof endpoints")
 	flag.BoolVar(&config.EnableSidecarHealthCheck, "sidecar-health", true, "Enable custon health check endpoint configuration for sidecar")
+	flag.BoolVar(&config.LocalityEnabled, "enable-locality", false, "Enable locality-aware routing")
 	flag.StringVar(&config.SidecarHealthCheckPath, "sidecar-health-path", "health", "Sidecar health check path")
 	flag.IntVar(&config.SidecarHealthCheckPort, "sidecar-health-port", 7313, "Sidecar health check port")
 

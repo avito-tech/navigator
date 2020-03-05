@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
@@ -22,6 +24,11 @@ import (
 	"github.com/avito-tech/navigator/pkg/xds/resources"
 )
 
+var navigatorGRPCRunning = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "navigator_grpc_running",
+	Help: "Navigator start to serve envoy grpc requests",
+})
+
 type Config struct {
 	KubeConfigs              []string
 	ServingAddress           string
@@ -33,9 +40,11 @@ type Config struct {
 	EnableSidecarHealthCheck bool
 	SidecarHealthCheckPath   string
 	SidecarHealthCheckPort   int
+	LocalityEnabled          bool
 }
 
 func Run(config Config) {
+	navigatorGRPCRunning.Set(0)
 	logger, err := getLogger(config.Loglevel, config.LogJSONFormatter)
 	if err != nil {
 		logrus.WithError(err).Fatal("cannot create logger")
@@ -46,13 +55,35 @@ func Run(config Config) {
 
 	k8sCache := k8s.NewCache(logger)
 	nexusCache := k8s.NewNexusCache()
+	ingressCache := k8s.NewIngressCache()
+	gatewayCache := k8s.NewGatewayCache()
 
 	opts := getResourcesOpts(config)
-	xdsCache := xds.NewCache(k8sCache, nexusCache, logger, opts)
+	xdsCache := xds.NewCache(k8sCache, nexusCache, ingressCache, gatewayCache, logger, opts)
 
 	if len(config.KubeConfigs) == 0 {
 		logger.Fatalf("At least 1 kubeconfig must be specified")
 	}
+
+	mux := http.NewServeMux()
+	handlers.RegisterMetrics(mux)
+	handlers.RegisterHealthCheck(mux)
+	mux.HandleFunc("/debug/app/k8s", xdsCache.GetAppsK8sState)
+	mux.HandleFunc("/debug/app/envoy", xdsCache.GetAppsEnvoyState)
+	if config.EnableProfiling {
+		handlers.RegisterProfile(mux)
+	}
+
+	httpServer := &http.Server{
+		Addr:    net.JoinHostPort(config.ServingAddress, config.HTTPPort),
+		Handler: mux,
+	}
+
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil {
+			logger.Errorf("Failed to serve metrics: %v", err)
+		}
+	}()
 
 	canary := k8s.NewCanary()
 	for _, kubeConfig := range config.KubeConfigs {
@@ -73,6 +104,8 @@ func Run(config Config) {
 			canary,
 			xdsCache,
 			nexusCache,
+			ingressCache,
+			gatewayCache,
 			kubeConfig,
 		)
 		k8sWatcher.Start(ctx)
@@ -91,28 +124,11 @@ func Run(config Config) {
 			logger.Errorf("Failed to serve GRPC: %v", err)
 		}
 	}()
-
-	mux := http.NewServeMux()
-	handlers.RegisterMetrics(mux)
-	handlers.RegisterHealthCheck(mux)
-	xdsCache.RegisterDebugXDS(mux)
-	if config.EnableProfiling {
-		handlers.RegisterProfile(mux)
-	}
-
-	httpServer := &http.Server{
-		Addr:    net.JoinHostPort(config.ServingAddress, config.HTTPPort),
-		Handler: mux,
-	}
-
-	go func() {
-		if err := httpServer.ListenAndServe(); err != nil {
-			logger.Errorf("Failed to serve metrics: %v", err)
-		}
-	}()
+	navigatorGRPCRunning.Set(1)
 
 	<-ctx.Done()
 	grpcServer.Stop()
+	navigatorGRPCRunning.Set(0)
 
 	httpCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -170,6 +186,9 @@ func getResourcesOpts(config Config) []resources.FuncOpt {
 	}
 	if config.EnableSidecarHealthCheck {
 		opts = append(opts, resources.WithHealthCheck(config.SidecarHealthCheckPath, config.SidecarHealthCheckPort))
+	}
+	if config.LocalityEnabled {
+		opts = append(opts, resources.WithLocalityEnabled())
 	}
 	return opts
 }

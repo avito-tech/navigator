@@ -14,31 +14,34 @@
 package grpc
 
 import (
-	"context"
-	"fmt"
-	"strconv"
 	"sync/atomic"
 
 	v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	"github.com/gogo/protobuf/proto"
-	"github.com/gogo/protobuf/types"
+	"github.com/golang/protobuf/ptypes"
+	"github.com/golang/protobuf/ptypes/any"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
 )
 
 // Resource represents a source of proto.Messages that can be registered
 // for interest.
 type Resource interface {
-	// Contents returns the contents of this resource.
-	Contents() []proto.Message
+	// Contents returns the contents of this resource and resources names.
+	Contents() ([]proto.Message, []string)
 
 	// Query returns an entry for each resource name supplied.
 	Query(names []string) []proto.Message
 
 	// Register registers ch to receive a value when Notify is called.
-	Register(chan int, int)
+	Register(name string, eventCh chan<- PushEvent)
+	Unregister(name string)
 
 	// TypeURL returns the typeURL of messages returned from Values.
 	TypeURL() string
+
+	Nonce() int
 }
 
 // ResourceGetter is a cache of Resource by serviceClusterID and typeURL
@@ -49,122 +52,54 @@ type ResourceGetter interface {
 
 // xdsHandler implements the Envoy xDS gRPC protocol.
 type xdsHandler struct {
-	logrus.FieldLogger
+	logger      logrus.FieldLogger
 	connections counter
 	resources   ResourceGetter
 }
 
 type grpcStream interface {
-	Context() context.Context
 	Send(*v2.DiscoveryResponse) error
 	Recv() (*v2.DiscoveryRequest, error)
+	grpc.ServerStream
+}
+
+type PushEvent interface {
+	ResourceType() string
+	Nonce() int
 }
 
 // stream processes a stream of DiscoveryRequests.
-func (xh *xdsHandler) stream(st grpcStream) (err error) {
+func (xh *xdsHandler) stream(st grpcStream) error {
+	conID := xh.connections.next()
+	logger := xh.getLoggerFromStream(st, conID)
+	logger.Debug("new connection")
+	con := newEnvoyConnecton(logger, xh.resources, st, conID)
+	return con.ProcessStream()
+}
+
+func (xh *xdsHandler) getLoggerFromStream(stream grpc.Stream, conID uint64) logrus.Ext1FieldLogger {
 	// bump connection counter and set it as a field on the logger
-	log := xh.WithField("connection", xh.connections.next())
-
-	// set up some nice function exit handling which notifies if the
-	// stream terminated on error or not.
-	defer func() {
-		if err != nil {
-			log.WithError(err).Error("stream terminated")
-		} else {
-			log.Trace("stream terminated")
-		}
-	}()
-
-	ch := make(chan int, 1)
-
-	// internally all registration values start at zero so sending
-	// a last that is less than zero will guarantee that each stream
-	// will generate a response immediately, then wait.
-	last := -1
-	ctx := st.Context()
-
-	// now stick in this loop until the client disconnects.
-	for {
-		// first we wait for the request from Envoy, this is part of
-		// the xDS protocol.
-		req, err := st.Recv()
-		if err != nil {
-			return err
-		}
-
-		// from the request we derive the resource to stream which have
-		// been registered according to the typeURL.
-		var appName, clusterID string
-		if req.Node != nil {
-			appName = req.Node.Id
-			clusterID = req.Node.Cluster
-		}
-		r, ok := xh.resources.Get(appName, req.TypeUrl, clusterID)
-		if !ok {
-			return fmt.Errorf("no resource registered for appName=%q typeURL=%q clusterID=%q", appName, req.TypeUrl, clusterID)
-		}
-
-		// stick some debugging details on the logger, not that we redeclare log in this scope
-		// so the next time around the loop all is forgotten.
-		log := log.WithField("version_info", req.VersionInfo).WithField("resource_names", req.ResourceNames).WithField("type_url", req.TypeUrl).WithField("response_nonce", req.ResponseNonce).WithField("error_detail", req.ErrorDetail)
-
-		for {
-			log.Trace("stream_wait")
-
-			// now we wait for a notification, if this is the first time through the loop
-			// then last will be less than zero and that will trigger a notification immediately.
-			r.Register(ch, last)
-			select {
-			case last = <-ch:
-				// boom, something in the cache has changed.
-				// TODO(dfc) the thing that has changed may not be in the scope of the filter
-				// so we're going to be sending an update that is a no-op. See #426
-
-				var resources []proto.Message
-				switch len(req.ResourceNames) {
-				case 0:
-					// no resource hints supplied, return the full
-					// contents of the resource
-					resources = r.Contents()
-				default:
-					// resource hints supplied, return exactly those
-					resources = r.Query(req.ResourceNames)
-				}
-
-				any, err := toAny(r.TypeURL(), resources)
-				if err != nil {
-					return err
-				}
-
-				resp := &v2.DiscoveryResponse{
-					VersionInfo: strconv.Itoa(last),
-					Resources:   any,
-					TypeUrl:     r.TypeURL(),
-					Nonce:       strconv.Itoa(last),
-				}
-				if err := st.Send(resp); err != nil {
-					return err
-				}
-				log.WithField("count", len(resources)).Trace("response")
-
-				// ok, the client hung up, return any error stored in the context and we're done.
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
+	peerInfo, ok := peer.FromContext(stream.Context())
+	var conAddr string
+	if ok {
+		conAddr = peerInfo.Addr.String()
 	}
+	return xh.logger.WithFields(logrus.Fields{
+		"connection": conID,
+		"address":    conAddr,
+	})
 }
 
 // toAny converts the contents of a resourcer's Values to the
-// respective slice of types.Any.
-func toAny(typeURL string, values []proto.Message) ([]types.Any, error) {
-	var resources []types.Any
+// respective slice of *any.Any.
+func toAny(typeURL string, values []proto.Message) ([]*any.Any, error) {
+	var resources []*any.Any
 	for _, value := range values {
-		v, err := proto.Marshal(value)
+		v, err := ptypes.MarshalAny(value)
 		if err != nil {
 			return nil, err
 		}
-		resources = append(resources, types.Any{TypeUrl: typeURL, Value: v})
+		resources = append(resources, v)
 	}
 	return resources, nil
 }

@@ -32,6 +32,10 @@ func (c *FakeNavigatorV1) CanaryReleases(namespace string) v1.CanaryReleaseInter
 	return &FakeCanaryReleases{c, namespace}
 }
 
+func (c *FakeNavigatorV1) Gateways(namespace string) v1.GatewayInterface {
+	return &FakeGateways{c, namespace}
+}
+
 func (c *FakeNavigatorV1) Nexuses(namespace string) v1.NexusInterface {
 	return &FakeNexuses{c, namespace}
 }

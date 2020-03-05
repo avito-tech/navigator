@@ -1,193 +1,196 @@
-// Copyright © 2018 Heptio
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package resources
 
 import (
-	"sort"
 	"sync"
 
-	api "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/endpoint"
-	"github.com/envoyproxy/go-control-plane/pkg/cache"
-	"github.com/gogo/protobuf/proto"
-	"github.com/gogo/protobuf/types"
-
-	"github.com/avito-tech/navigator/pkg/grpc"
 	"github.com/avito-tech/navigator/pkg/k8s"
+	api "github.com/envoyproxy/go-control-plane/envoy/api/v2"
+	endpoint "github.com/envoyproxy/go-control-plane/envoy/api/v2/endpoint"
+	"github.com/envoyproxy/go-control-plane/pkg/cache"
+	"github.com/golang/protobuf/ptypes/wrappers"
 )
 
 type EndpointCache struct {
-	observable
+	muUpdate sync.RWMutex
 
-	mu                    sync.Mutex
-	clusterNamesByService map[k8s.QualifiedName][]*api.ClusterLoadAssignment
+	*BranchedResourceCache
+
+	localityEnabled bool
 }
 
 func NewEndpointCache(opts ...FuncOpt) *EndpointCache {
 	e := &EndpointCache{
-		clusterNamesByService: map[k8s.QualifiedName][]*api.ClusterLoadAssignment{},
+		BranchedResourceCache: NewBranchedResourceCache(cache.EndpointType),
 	}
 	SetOpts(e, opts...)
 	return e
 }
 
-func (c *EndpointCache) Get(clusterID string) (resource grpc.Resource, ok bool) {
-	// return whole EndpointCache due to envoy clusters shared across all k8s clusters
-	return c, true
+func (c *EndpointCache) SetLocalityEnabled(enabled bool) {
+	c.localityEnabled = enabled
 }
 
-func (c *EndpointCache) AddService(service *k8s.Service) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *EndpointCache) UpdateServices(updated, deleted []*k8s.Service) {
 
-	serviceKey := service.Key()
-	c.removeServiceByName(serviceKey)
+	c.muUpdate.Lock()
+	defer c.muUpdate.Unlock()
 
+	updatedResource := map[string][]NamedProtoMessage{}
+	deletedResources := map[string][]NamedProtoMessage{}
+
+	for _, u := range updated {
+		c.getServiceEndpoints(updatedResource, u)
+	}
+	for _, d := range deleted {
+		c.getServiceEndpoints(deletedResources, d)
+	}
+
+	c.UpdateBranchedResources(updatedResource, deletedResources)
+}
+
+func (c *EndpointCache) UpdateIngresses(updated map[k8s.QualifiedName]*k8s.Ingress) {
+	// do nothing
+}
+
+func (c *EndpointCache) UpdateGateway(gw *k8s.Gateway) {
+	// do nothing
+}
+
+func (c *EndpointCache) getServiceEndpoints(storage map[string][]NamedProtoMessage, service *k8s.Service) {
 	for _, p := range service.Ports {
 		if p.Protocol != k8s.ProtocolTCP {
 			continue
 		}
 
-		switch getClusterType(p.Name) {
-		case TCPCluster:
-			name := TCPClusterName(service.Namespace, service.Name, p.Name)
-			cla := getCLA(name, p.TargetPort, service.BackendsBySourceID)
-			c.clusterNamesByService[serviceKey] = append(c.clusterNamesByService[serviceKey], cla)
-
-		case HTTPCluster:
-			for backend, backendsBySourceID := range service.BackendsBySourceID {
-				name := HTTPClusterName(backend, p.Name)
-				cla := getCLA(name, p.TargetPort, map[k8s.BackendSourceID]k8s.WeightedAddressSet{backend: backendsBySourceID})
-				c.clusterNamesByService[serviceKey] = append(c.clusterNamesByService[serviceKey], cla)
+		name := ClusterName(service.Namespace, service.Name, p.Name)
+		clusterIDs := map[string]struct{}{}
+		for sid := range service.BackendsBySourceID {
+			clusterIDs[sid.ClusterID] = struct{}{}
+		}
+		for clusterID := range clusterIDs {
+			cla := c.getCLA(clusterID, name, p.TargetPort, service.BackendsBySourceID)
+			if _, ok := storage[clusterID]; !ok {
+				storage[clusterID] = []NamedProtoMessage{}
 			}
+			storage[clusterID] = append(storage[clusterID], cla)
 		}
 	}
-
-	return nil
 }
 
-func getCLA(name string, targetPort int, backendsBySourceID map[k8s.BackendSourceID]k8s.WeightedAddressSet) *api.ClusterLoadAssignment {
+func (c *EndpointCache) getCLA(localClusterID, name string, targetPort int, backendsBySourceID map[k8s.BackendSourceID]k8s.WeightedAddressSet) *api.ClusterLoadAssignment {
+	// 1. count scale param for the right incluster per pod weight ratio
+	clusterInnerScale := map[k8s.BackendSourceID]int{}
+	clusterEPs := map[string][]int{}
+	clusterEPsScale := map[string]int{}
+	for sourceID, backends := range backendsBySourceID {
+		if len(backends.AddrSet) == 0 {
+			continue
+		}
+		if _, ok := clusterEPs[sourceID.ClusterID]; !ok {
+			clusterEPs[sourceID.ClusterID] = []int{}
+		}
+		clusterEPs[sourceID.ClusterID] = append(clusterEPs[sourceID.ClusterID], len(backends.AddrSet))
+	}
+	for clusterID, epsCount := range clusterEPs {
+		clusterEPsScale[clusterID] = LCM(epsCount)
+	}
+	for sourceID, backends := range backendsBySourceID {
+		if len(backends.AddrSet) == 0 {
+			continue
+		}
+		clusterInnerScale[sourceID] = clusterEPsScale[sourceID.ClusterID] / len(backends.AddrSet)
+	}
+
+	// 2. count per cluster sum weight
+	clusterWeight := map[string]int{}
+	for sourceID, backends := range backendsBySourceID {
+		if _, ok := clusterInnerScale[sourceID]; !ok {
+			continue
+		}
+		if _, ok := clusterWeight[sourceID.ClusterID]; !ok {
+			clusterWeight[sourceID.ClusterID] = 0
+		}
+		clusterWeight[sourceID.ClusterID] += backends.Weight * clusterInnerScale[sourceID] * len(backends.AddrSet)
+	}
+
+	// 3. count per cluster scale param for sum cluster weight aligment
+	clusterOuterScale := map[string]int{}
+	clusterSumWeights := []int{}
+	for _, w := range clusterWeight {
+		clusterSumWeights = append(clusterSumWeights, w)
+	}
+	clusterSumWeight := LCM(clusterSumWeights)
+	for clusterID, w := range clusterWeight {
+		clusterOuterScale[clusterID] = clusterSumWeight / w
+	}
+
+	eps := make([]*endpoint.LocalityLbEndpoints, 0, len(backendsBySourceID))
+	for sid, backends := range backendsBySourceID {
+		ep := &endpoint.LocalityLbEndpoints{}
+		if !c.localityEnabled || sid.ClusterID == localClusterID {
+			ep.Priority = 0
+		} else {
+			ep.Priority = 1
+		}
+
+		for _, backend := range backends.AddrSet {
+			w := clusterInnerScale[sid] * clusterOuterScale[sid.ClusterID] * backends.Weight
+			if w == 0 {
+				w = 1
+			}
+			ep.LbEndpoints = append(
+				ep.LbEndpoints,
+				lbEndpoint(backend.IP, targetPort, uint32(w)),
+			)
+		}
+		eps = append(eps, ep)
+	}
+
 	cla := &api.ClusterLoadAssignment{
 		ClusterName: name,
-		Endpoints:   make([]endpoint.LocalityLbEndpoints, len(backendsBySourceID)),
+		Endpoints:   eps,
+		Policy: &api.ClusterLoadAssignment_Policy{
+			OverprovisioningFactor: &wrappers.UInt32Value{Value: 100},
+		},
 	}
 
-	// clusterID -> multiply coeff to support equal final sum in each cluster
-	balancingCoeffs := make(map[string]float32)
-	for sourceID, backends := range backendsBySourceID {
-		balancingCoeffs[sourceID.ClusterID] += float32(backends.Weight)
-	}
-	for k, sum := range balancingCoeffs {
-		balancingCoeffs[k] = float32(k8s.EndpointsWeightSumForCluster) / sum
-	}
-
-	i := 0
-	for _, backends := range backendsBySourceID {
-		cla.Endpoints[i].LoadBalancingWeight = &types.UInt32Value{Value: uint32(backends.Weight)}
-		//TODO: add locality here
-		for _, backend := range backends.AddrSet {
-			// TODO: compute locality
-			//cla.Endpoints[0].Locality = backend.ClusterID
-			cla.Endpoints[i].LbEndpoints = append(cla.Endpoints[i].LbEndpoints,
-				lbEndpoint(
-					backend.IP,
-					targetPort,
-					uint32(
-						(float32(backends.Weight)/float32(len(backends.AddrSet)))*balancingCoeffs[backend.ClusterID])))
-		}
-		i++
-	}
 	return cla
 }
 
-func (c *EndpointCache) RemoveService(serviceKey k8s.QualifiedName) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.removeServiceByName(serviceKey)
-
-	return nil
-}
-
-func (c *EndpointCache) removeServiceByName(serviceKey k8s.QualifiedName) {
-	if c.clusterNamesByService == nil {
-		c.clusterNamesByService = make(map[k8s.QualifiedName][]*api.ClusterLoadAssignment)
-	}
-
-	c.clusterNamesByService[serviceKey] = nil
-}
-
-func (c *EndpointCache) getNameToCLAMapping() map[string]*api.ClusterLoadAssignment {
-	mapOfCLA := make(map[string]*api.ClusterLoadAssignment)
-	for _, v := range c.clusterNamesByService {
-		for _, c := range v {
-			mapOfCLA[c.ClusterName] = c
-		}
-	}
-
-	return mapOfCLA
-}
-
-// Contents returns a copy of the contents of the cache.
-func (c *EndpointCache) Contents() []proto.Message {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var values []proto.Message
-	for _, v := range c.getNameToCLAMapping() {
-		values = append(values, v)
-	}
-
-	sort.Stable(clusterLoadAssignmentsByName(values))
-	return values
-}
-
-func (c *EndpointCache) Query(names []string) []proto.Message {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	mapOfCLAs := c.getNameToCLAMapping()
-	var values []proto.Message
-	for _, n := range names {
-		v, ok := mapOfCLAs[n]
-		if !ok {
-			v = &api.ClusterLoadAssignment{
-				ClusterName: n,
-			}
-		}
-		values = append(values, v)
-	}
-	sort.Stable(clusterLoadAssignmentsByName(values))
-	return values
-}
-
-func (*EndpointCache) TypeURL() string { return cache.EndpointType }
-
-type clusterLoadAssignmentsByName []proto.Message
-
-func (c clusterLoadAssignmentsByName) Len() int      { return len(c) }
-func (c clusterLoadAssignmentsByName) Swap(i, j int) { c[i], c[j] = c[j], c[i] }
-func (c clusterLoadAssignmentsByName) Less(i, j int) bool {
-	return c[i].(*api.ClusterLoadAssignment).ClusterName < c[j].(*api.ClusterLoadAssignment).ClusterName
-}
-
 // lbEndpoint creates a new socketAddress LbEndpoint.
-func lbEndpoint(addr string, port int, weight uint32) endpoint.LbEndpoint {
-	return endpoint.LbEndpoint{
+func lbEndpoint(addr string, port int, weight uint32) *endpoint.LbEndpoint {
+	return &endpoint.LbEndpoint{
 		HostIdentifier: &endpoint.LbEndpoint_Endpoint{
 			Endpoint: &endpoint.Endpoint{
 				Address: socketAddress(addr, port),
 			},
 		},
-		LoadBalancingWeight: &types.UInt32Value{Value: weight},
+		LoadBalancingWeight: &wrappers.UInt32Value{Value: weight},
 	}
+}
+
+// GCD finds greatest common divisor (GCD) via Euclidean algorithm
+func GCD(a, b int) int {
+	for b != 0 {
+		t := b
+		b = a % b
+		a = t
+	}
+	return a
+}
+
+// LCM finds Least Common Multiple (LCM) via GCD
+func LCM(numbers []int) int {
+	switch len(numbers) {
+	case 0:
+		return 0
+		// case 1:
+		// 	return numbers[0]
+	}
+	a := numbers[0]
+	for i := 1; i < len(numbers); i++ {
+		b := numbers[i]
+		a = a * b / GCD(a, b)
+	}
+	return a
 }

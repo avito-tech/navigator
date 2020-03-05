@@ -29,9 +29,21 @@ func TestWatcherStart(t *testing.T) {
 	fakeCanary := &MockCanary{}
 	fakeNotifier := &MockNotifier{}
 	fakeNexusCache := &MockNexusCache{}
+	fakeIngressCache := &MockIngressCache{}
+	fakeGatewayCache := &MockGatewayCache{}
 	clusterID := "alpha"
 
-	watcher := NewWatcher(logger, cs, extCs, fakeCache, fakeCanary, fakeNotifier, fakeNexusCache, clusterID)
+	watcher := NewWatcher(
+		logger,
+		cs,
+		extCs,
+		fakeCache,
+		fakeCanary,
+		fakeNotifier,
+		fakeNexusCache,
+		fakeIngressCache,
+		fakeGatewayCache,
+		clusterID)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	watcher.Start(ctx)
@@ -64,6 +76,14 @@ func TestWatcherStart(t *testing.T) {
 				resource: "canaryreleases",
 			},
 			{
+				verb:     "list",
+				resource: "gateways",
+			},
+			{
+				verb:     "list",
+				resource: "ingresses",
+			},
+			{
 				verb:     "watch",
 				resource: "services",
 			},
@@ -78,6 +98,14 @@ func TestWatcherStart(t *testing.T) {
 			{
 				verb:     "watch",
 				resource: "canaryreleases",
+			},
+			{
+				verb:     "watch",
+				resource: "gateways",
+			},
+			{
+				verb:     "watch",
+				resource: "ingresses",
 			},
 		},
 	}
@@ -112,6 +140,8 @@ func TestWatcherStartWorking(t *testing.T) {
 	fakeCanary := &MockCanary{}
 	fakeNotifier := &MockNotifier{}
 	fakeNexusCache := &MockNexusCache{}
+	fakeIngressCache := &MockIngressCache{}
+	fakeGatewayCache := &MockGatewayCache{}
 
 	ip := "1.1.1.1"
 	clusterID := "alpha"
@@ -130,7 +160,17 @@ func TestWatcherStartWorking(t *testing.T) {
 	callNotify := fakeNotifier.On("NotifyServicesUpdated", []QualifiedName{svcName})
 	callNotify.Return()
 
-	watcher := NewWatcher(logger, cs, extCs, fakeCache, fakeCanary, fakeNotifier, fakeNexusCache, clusterID)
+	watcher := NewWatcher(
+		logger,
+		cs,
+		extCs,
+		fakeCache,
+		fakeCanary,
+		fakeNotifier,
+		fakeNexusCache,
+		fakeIngressCache,
+		fakeGatewayCache,
+		clusterID)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -170,6 +210,8 @@ func TestWatcherStartWorking(t *testing.T) {
 	time.Sleep(time.Second * 1)
 	fakeCache.AssertExpectations(t)
 	fakeCanary.AssertExpectations(t)
+	fakeGatewayCache.AssertExpectations(t)
+	fakeIngressCache.AssertExpectations(t)
 	fakeNotifier.AssertExpectations(t)
 	cancel()
 }
